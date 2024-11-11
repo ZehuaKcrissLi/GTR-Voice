@@ -1,3 +1,4 @@
 *.py linguist-language=Python
 *.ipynb linguist-language=Jupyter Notebook
 *.3 linguist-language=text
+*.3 linguist-documentation
