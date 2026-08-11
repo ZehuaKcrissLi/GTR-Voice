@@ -1,16 +1,18 @@
+
+
 <p align="center">
 
   <h2 align="center">[Interspeech'24] GTR-Voice: Articulatory Phonetics Informed Controllable Expressive Speech Synthesis </h2>
   <p align="center">
-    <strong>Zehua Kcriss Li</strong></a><sup>1</sup>
+    <strong>Zehua Kcriss Li</strong><sup>1</sup>
     · 
-    <strong>Meiying Melissa Chen</strong></a><sup>1</sup>
+    <strong>Meiying Melissa Chen</strong><sup>1</sup>
     · 
-    <strong>Yi Zhong</strong></a><sup>1</sup>
+    <strong>Yi Zhong</strong><sup>1</sup>
     ·
-    <strong>Pinxin Liu</strong></a><sup>2</sup>
+    <strong>Pinxin Liu</strong><sup>2</sup>
     ·
-    <strong>Zhiyao Duan</strong></a><sup>1</sup>
+    <strong>Zhiyao Duan</strong><sup>1</sup>
     ·
     <br>
     <sup>1</sup>Department of Electrical and Computer Engineering, University of Rochester; 
@@ -108,6 +110,3 @@ If you find our work useful, please consider citing:
   year={2024}
 }
 ```
-
-
-
