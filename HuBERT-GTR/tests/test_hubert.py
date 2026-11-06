@@ -17,6 +17,30 @@ def module(name, filename):
 
 
 class ModelContractTests(unittest.TestCase):
+    def test_legacy_split_replay_requires_stable_fields_and_verified_source_guard(self):
+        import copy
+        main = module("gtr_hubert_legacy_split_test", "main.py")
+        current = {"method": "stratified", "seed": 42, "test_size": .2,
+                   "test_sentences": [], "train_ids": ["a"], "test_ids": ["b"],
+                   "unused_validation_ids": [], "paper_original_split": "not reported",
+                   "source_separation": {"status": "VERIFIED_NO_SHARED_SOURCE_SHA256",
+                                         "known_shared_source_hashes": 0}}
+        old = {key: value for key, value in current.items() if key != "source_separation"}
+        result = main.verify_checkpoint_split(current, old)
+        self.assertEqual(result["checkpoint_split_metadata"], "legacy_stable_fields_with_recomputed_guard")
+        self.assertEqual(result["source_separation"], current["source_separation"])
+        self.assertEqual(main.verify_checkpoint_split(current, current)["checkpoint_split_metadata"], "current")
+        for changed in [{**old, "test_ids": ["wrong"]}, {**old, "seed": 7},
+                        {key: value for key, value in old.items() if key != "train_ids"},
+                        {**old, "unknown_field": "cannot-ignore"},
+                        {**current, "source_separation": {"status": "UNKNOWN_MISSING_SOURCE_SHA256"}}]:
+            with self.subTest(changed=changed), self.assertRaises(ValueError):
+                main.verify_checkpoint_split(current, changed)
+        unknown = copy.deepcopy(current)
+        unknown["source_separation"]["status"] = "UNKNOWN_MISSING_SOURCE_SHA256"
+        with self.assertRaisesRegex(ValueError, "source separation is UNKNOWN"):
+            main.verify_checkpoint_split(unknown, old)
+
     def test_all_cli_entries_are_local_by_default_and_download_is_explicit(self):
         import contextlib
         import io
@@ -130,6 +154,23 @@ class ModelContractTests(unittest.TestCase):
             self.assertEqual(trained["metrics"]["label_order"], [1, 2, 3, 4, 5])
             checkpoint = torch.load(output / "model.pt", map_location="cpu", weights_only=True)
             self.assertEqual(checkpoint["feature_index_sha256"], module("gtr_hubert_data_test", "dataset.py").file_sha256(cache / "index.jsonl"))
+            # Trusted local copy of a pre-guard checkpoint: identical model,
+            # cache and IDs, with only the later-added metadata field absent.
+            del checkpoint["split"]["source_separation"]
+            legacy_path = root / "trusted-legacy-model.pt"
+            torch.save(checkpoint, legacy_path)
+            legacy = json.loads(subprocess.check_output(command + ["evaluate", "--features", str(cache),
+                "--checkpoint", str(legacy_path), "--device", "cpu"], text=True))
+            self.assertEqual(legacy["metrics"], independent["metrics"])
+            self.assertEqual(legacy["source_separation"]["status"], "VERIFIED_NO_SHARED_SOURCE_SHA256")
+            self.assertEqual(legacy["checkpoint_split_metadata"], "legacy_stable_fields_with_recomputed_guard")
+            checkpoint["split"]["test_ids"] = ["a-different-held-out-identity"]
+            torch.save(checkpoint, root / "drifted-legacy-model.pt")
+            rejected = subprocess.run(command + ["evaluate", "--features", str(cache),
+                "--checkpoint", str(root / "drifted-legacy-model.pt"), "--device", "cpu"],
+                text=True, capture_output=True)
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertIn("Held-out split differs", rejected.stderr)
 
 
 if __name__ == "__main__":

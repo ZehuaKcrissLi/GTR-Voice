@@ -101,7 +101,7 @@ def prepare(args):
             wave = librosa.resample(wave, orig_sr=rate, target_sr=args.sampling_rate)
         if len(wave) <= args.filter_length or np.abs(wave).max() <= 0 or np.abs(wave).max() > 1:
             raise ValueError(f'source is short, silent or exceeds PCM range: {item["id"]}')
-        safe_id = re.sub(r'[^A-Za-z0-9_.-]+', '_', str(item['id']))
+        safe_id = re.sub(r'[^A-Za-z0-9_.-]+', '_', str(Path(str(item['id'])).with_suffix('')))
         stem = f'{item["label"]}_{safe_id}'
         if stem in used_names:
             raise ValueError('sample ids collide after filename sanitization')

@@ -104,7 +104,7 @@ def test_derived_preparation_preserves_source_and_matches_pitch_grid(tmp_path):
     sf.write(source, wave, 16000, subtype='PCM_16')
     source_sha = hashlib.sha256(source.read_bytes()).hexdigest()
     manifest = tmp_path / 'input.jsonl'
-    manifest.write_text(json.dumps({'id': '010-04', 'source_path': str(source),
+    manifest.write_text(json.dumps({'id': '010/04.wav', 'source_path': str(source),
                                    'source_sha256': source_sha, 'label': '010',
                                    'utterance_id': '04', 'text': 'A test.',
                                    'split': 'train'}) + '\n')
@@ -117,6 +117,9 @@ def test_derived_preparation_preserves_source_and_matches_pitch_grid(tmp_path):
     mel = torch.load(row['mel_path'], weights_only=True)
     pitch = torch.load(row['pitch_path'], weights_only=True)
     assert mel.shape[0] == 100 and mel.shape[-1] == pitch.shape[-1]
+    from fastpitch.data_function import TTSDataset
+    loader = TTSDataset.__new__(TTSDataset); loader.load_mel_from_disk = True
+    assert torch.equal(loader.get_mel(row['derived_wav']), mel)
     assert torch.isfinite(mel).all() and torch.isfinite(pitch).all()
     assert float(pitch[pitch > 0].median()) == pytest.approx(220, abs=5)
     receipt = json.loads((output / 'preparation.json').read_text())
@@ -223,3 +226,15 @@ def test_malformed_pcm_frame_is_rejected_without_editing_original(tmp_path, modu
     with pytest.raises(ValueError, match='Incomplete PCM frame'):
         importlib.import_module(module_name).check_source_wav(source)
     assert source.read_bytes() == before
+
+
+def test_mandarin_frontend_finds_bundled_dictionary_outside_checkout_cwd(tmp_path):
+    import os
+    import subprocess
+    module = Path(__file__).resolve().parents[1]
+    environment = dict(os.environ, PYTHONPATH=str(module))
+    command = "from common.text.text_processing import get_text_processing; from common.text.symbols import get_symbols; tp=get_text_processing('english_mandarin_basic',['english_cleaners_v2'],0.); tokens=tp.encode_text('中国银行卡产业近年来发展迅速'); symbols=get_symbols('english_mandarin_basic'); assert len(tokens)>0 and min(tokens)>=0 and max(tokens)<len(symbols); assert any(symbols[x].startswith('#') for x in tokens); print('REAL_MANDARIN_FRONTEND_OK',len(tokens))"
+    result = subprocess.run([sys.executable, '-B', '-c', command], cwd=tmp_path,
+                            env=environment, text=True, capture_output=True)
+    assert result.returncode == 0, result.stderr
+    assert 'REAL_MANDARIN_FRONTEND_OK' in result.stdout

@@ -74,3 +74,34 @@ It reloads the saved artifact and requires identical held-out predictions.
 `evaluate` checks the cached IDs/hashes and configuration against the saved
 split. Only load trusted joblib files. `--all-samples` is explicitly labeled as
 including training samples and must not be described as held-out performance.
+
+Train/test partitions are checked for shared original-source SHA256 values, even
+when copied WAVs have different paths or IDs. A cross-partition match is an
+error. The split receipt records source-hash coverage; missing hashes are
+`UNKNOWN`, and SVM training refuses such a cache before fitting. Re-extract an
+audited cache rather than claiming verified separation from paths alone. The
+check uses hashes bound into the extraction cache; it does not prove an
+unpublished paper split or reread every original during training.
+
+
+## Measured full-data validation (2026-11-06)
+
+A run on the 2,486 valid original clips completed all twelve feature families
+with 184 mean-pooled features per clip and no further extraction rejections.
+The fourteen previously identified malformed originals were explicitly excluded
+by the clean manifest and left unchanged. Both protocols below reuse the exact
+same feature bytes and C=0.1/gamma=0.001/RBF/train-only StandardScaler settings;
+neither protocol was tuned to the paper's results.
+
+| New measured protocol | Train / test clips | G accuracy | T accuracy | R accuracy |
+| --- | --- | --- | --- | --- |
+| GTR-label-stratified 80/20, seed42 | 1988 / 498 | 304/498 (61.04%) | 264/498 (53.01%) | 382/498 (76.71%) |
+| Sentence IDs17–20 held out | 1990 / 496 | 274/496 (55.24%) | 261/496 (52.62%) | 390/496 (78.63%) |
+
+For both runs, saved-model reload and a separate-process evaluation produced
+identical predictions, scalers matched training rows only, and source SHA256
+coverage was complete with no shared train/test hash. The feature-cache SHA256
+was `403eab5816248950aa272b0bd30436328d86db645023c1d0a19e0f316319269e`.
+These are new, single-speaker validation results and differ from the paper's
+reported accuracies. The unpublished original split, aggregation and complete
+SVM setup remain unknown; this is not an exact accuracy reproduction claim.

@@ -163,3 +163,48 @@ extension itself is ARM64 and imports/tensor execution work, but current
 `pip check`/`uv pip check` report a platform warning. The wheel metadata is not
 patched here. Installation, regression tests and actual inference are recorded
 separately from that packaging warning; Linux CPU CI checks its own wheel.
+
+## Measured runs on the original released audio (2026-11-06)
+
+All 2,500 WAV members of the public ZIP were byte-matched against the experiment
+originals. The 2,486 eligible originals were used without modifying source bytes.
+Machine-readable aggregates and artifact hashes are in
+[reproduction-results.json](reproduction-results.json).
+
+| New SVM protocol | Train / test | G accuracy | T accuracy | R accuracy |
+|---|---:|---:|---:|---:|
+| Stratified 80/20, seed 42 | 1988 / 498 | 61.0442% | 53.0120% | 76.7068% |
+| Hold out utterances 17–20 | 1990 / 496 | 55.2419% | 52.6210% | 78.6290% |
+
+Both runs use all twelve feature families, 184 mean-pooled features, RBF SVC
+C=0.1/gamma=0.001 and a scaler fit only on training data. Independent new-process
+evaluation exactly matched saved-model predictions; source hashes were disjoint
+across folds. No hyperparameters were tuned to the paper's reported numbers.
+These measured accuracies differ from the paper's 85%/83%/94%; they are new
+explicit protocols, not a recovered original benchmark configuration.
+
+The identified public StyleTTS base produced targets for 2,239 training and 247
+validation recordings, holding out utterances 19–20 across all 125 labels. Both
+embedders completed 500 epochs (batch 64, Adam LR 0.001, seed 1234), followed by strict
+new-process evaluation and three full text/GTR-to-WAV exports at 24 kHz.
+
+| Derived StyleTTS embedder | Train embedding MSE | Held-out embedding MSE |
+|---|---:|---:|
+| legacy | 0.00464641 | 0.00555047 |
+| paper-described | 0.00474630 | 0.00560335 |
+
+The paper-described variant uses a derived 125×32 joint embedding and 32→64→128
+Linear/ReLU/Linear mapping; the paper did not report these dimensions. The
+legacy variant preserves released checkpoint keys and architecture. Both use
+the public base identified above, which differs from the paper's base-training
+description. Embedding MSE and finite, non-silent decoded audio are engineering
+observations, not human MOS or proof of perceptual G/T/R control.
+
+FastPitch's complete optimizer/checkpoint/resume/inference engineering path
+passed. Three actual original Mandarin recordings also passed independent 24 kHz
+100-mel/pitch preparation, source-hash preservation, Mandarin phoneme encoding,
+real dataset loading and collation. A real-source BigVGAN reconstruction passed.
+The original compatible AISHELL3/GTR checkpoint has not been acquired and
+validated, so 80+3000 epoch paper training and paper-quality conditioned FastPitch
+synthesis remain unverified. No different TTS architecture or random model is
+substituted for that missing asset.

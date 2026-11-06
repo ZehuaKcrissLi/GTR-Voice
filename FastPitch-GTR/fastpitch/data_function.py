@@ -362,7 +362,9 @@ class TTSDataset(torch.utils.data.Dataset):
             melspec = torch.squeeze(melspec, 0)
 
         else:
-            melspec = torch.load(filename.replace('.wav', '.pt').replace('/wavs/', '/mels/'), weights_only=True)
+            mel_path = Path(filename).with_suffix('.pt')
+            mel_path = Path(*('mels' if part == 'wavs' else part for part in mel_path.parts))
+            melspec = torch.load(mel_path, weights_only=True)
             # melspec = torch.load(filename)
 
             # assert melspec.size(0) == self.stft.n_mel_channels, (

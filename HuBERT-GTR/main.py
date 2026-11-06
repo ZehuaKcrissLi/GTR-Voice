@@ -137,6 +137,24 @@ def run_train(args):
     return report
 
 
+def verify_checkpoint_split(current, saved):
+    """Replay old metadata only after independently verifying source separation."""
+    stable_fields = {"method", "seed", "test_size", "test_sentences", "train_ids",
+                     "test_ids", "unused_validation_ids", "paper_original_split"}
+    allowed = stable_fields | {"source_separation"}
+    if not isinstance(saved, dict) or not stable_fields <= saved.keys() or set(saved) - allowed:
+        raise ValueError("Saved checkpoint split metadata is incomplete or unrecognized")
+    if {key: current[key] for key in stable_fields} != {key: saved[key] for key in stable_fields}:
+        raise ValueError("Held-out split differs from saved model")
+    guard = current.get("source_separation", {})
+    if guard.get("status") != "VERIFIED_NO_SHARED_SOURCE_SHA256":
+        raise ValueError("Held-out source separation is UNKNOWN; re-extract an audited cache")
+    if "source_separation" in saved and saved["source_separation"] != guard:
+        raise ValueError("Source separation differs from saved checkpoint")
+    return {"source_separation": guard,
+            "checkpoint_split_metadata": "current" if "source_separation" in saved else "legacy_stable_fields_with_recomputed_guard"}
+
+
 def run_evaluate(args):
     import torch
     from torch.utils.data import DataLoader
@@ -147,8 +165,9 @@ def run_evaluate(args):
     dataset = AudioDataset(args.features, GTR=checkpoint["axis"], mode="test",
         seed=original["seed"], test_size=original["test_size"], split=original["split"],
         test_sentences=original["test_sentences"])
-    if dataset.index_sha256 != checkpoint["feature_index_sha256"] or dataset.split_record != checkpoint["split"]:
-        raise ValueError("Feature index or held-out split differs from saved model")
+    if dataset.index_sha256 != checkpoint["feature_index_sha256"]:
+        raise ValueError("Feature index differs from saved model")
+    split_validation = verify_checkpoint_split(dataset.split_record, checkpoint["split"])
     model_path = args.model_path or checkpoint["model_path"]
     kind = GTRClassifier if checkpoint["task"] == "classification" else GTRRegressor
     extra = {"num_classes": len(checkpoint["label_order"])} if checkpoint["task"] == "classification" else {}
@@ -158,7 +177,8 @@ def run_evaluate(args):
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"));model.to(device)
     loader = DataLoader(dataset, batch_size=args.batch_size, collate_fn=AudioDataset.collation_fn)
     return {"status": "SAVED_MODEL_EVALUATED", "metrics": evaluate_model(model, loader, device, checkpoint["task"]),
-            "checkpoint_sha256": file_sha256(args.checkpoint), "paper_reported_method": False}
+            "checkpoint_sha256": file_sha256(args.checkpoint), "paper_reported_method": False,
+            **split_validation}
 
 
 def add_model_access_args(parser):

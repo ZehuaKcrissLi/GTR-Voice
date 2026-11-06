@@ -120,6 +120,37 @@ def load_records(*, data_root=None, manifest=None) -> list[dict]:
     return sorted(records, key=lambda row: row["id"])
 
 
+def verify_source_separation(records, train_indices, test_indices):
+    """Reject identical original audio bytes crossing train/test partitions.
+
+    Cached extraction records bind these hashes to source bytes. Missing hashes
+    remain explicitly unknown: different paths or IDs alone prove no separation.
+    """
+    hashes, missing = {}, {}
+    for name, indices in [("train", train_indices), ("test", test_indices)]:
+        hashes[name], missing[name] = set(), []
+        for index in indices:
+            row = records[int(index)]
+            value = row.get("source_sha256")
+            if value is None or value == "":
+                missing[name].append(row["id"])
+            elif not isinstance(value, str) or not re.fullmatch(r"[a-f0-9]{64}", value):
+                raise ValueError(f"Invalid cached source SHA256: {row['id']}")
+            else:
+                hashes[name].add(value)
+    shared = hashes["train"] & hashes["test"]
+    if shared:
+        raise ValueError(f"Same source SHA256 appears in train and test ({len(shared)} distinct audio payloads); "
+                         "different paths or IDs do not establish a held-out sample")
+    unknown = any(missing.values())
+    return {"status": "UNKNOWN_MISSING_SOURCE_SHA256" if unknown else "VERIFIED_NO_SHARED_SOURCE_SHA256",
+            "identity_basis": "SHA256 stored by extraction; original sources are not reread during splitting",
+            "known_train_source_hashes": len(hashes["train"]),
+            "known_test_source_hashes": len(hashes["test"]),
+            "known_shared_source_hashes": 0,
+            "missing_source_sha256_ids": missing}
+
+
 def make_split(records, *, method="stratified", test_size=0.2, seed=42, test_sentences=None):
     import numpy as np
     from sklearn.model_selection import train_test_split
@@ -146,9 +177,11 @@ def make_split(records, *, method="stratified", test_size=0.2, seed=42, test_sen
     train, test = np.asarray(sorted(train), dtype=int), np.asarray(sorted(test), dtype=int)
     if not len(train) or not len(test) or set(train).intersection(test):
         raise ValueError("Train and test must be nonempty and disjoint")
+    source_separation = verify_source_separation(records, train, test)
     return train, test, {"method": method, "seed": seed, "test_size": test_size,
                          "test_sentences": list(test_sentences or []),
                          "train_ids": [records[i]["id"] for i in train],
                          "test_ids": [records[i]["id"] for i in test],
                          "unused_validation_ids": [records[i]["id"] for i in unused],
+                         "source_separation": source_separation,
                          "paper_original_split": "not reported"}

@@ -54,3 +54,11 @@ requires the same indexed feature bytes and held-out split. Checkpoints use
 `torch.load(weights_only=True)` and should still come from a trusted run.
 These engineering checks do not establish useful GTR accuracy or perceptual
 control; a real pretrained model and full-data evaluation are separate evidence.
+
+Checkpoints created before the source-hash separation receipt was added can be
+evaluated with the same indexed feature bytes and all original stable split
+fields unchanged. Evaluation independently recalculates the current SHA256
+separation guard and requires verified coverage; missing source hashes or shared
+train/test source bytes remain errors. The result labels this metadata-only
+compatibility path. Changed test IDs, split settings, feature-index bytes or an
+existing guard receipt are never ignored to make an old checkpoint load.

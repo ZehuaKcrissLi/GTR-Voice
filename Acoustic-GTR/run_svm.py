@@ -13,7 +13,7 @@ import json
 from pathlib import Path
 import sys
 
-from gtr_data import LABEL_VALUES, file_sha256, load_records, make_split, parse_label
+from gtr_data import LABEL_VALUES, file_sha256, load_records, make_split, parse_label, verify_source_separation
 
 PAPER_ACCURACIES = {"G": 0.85, "T": 0.83, "R": 0.94}
 
@@ -122,6 +122,10 @@ def train(args):
     x, labels, metadata = load_cache(args.features)
     train_indices, test_indices, split = make_split(metadata["records"], method=args.split,
         test_size=args.test_size, seed=args.seed, test_sentences=args.test_sentences)
+    missing_hashes = [row["id"] for row in metadata["records"] if not row.get("source_sha256")]
+    if split["source_separation"]["status"] != "VERIFIED_NO_SHARED_SOURCE_SHA256" or missing_hashes:
+        raise ValueError("Source separation is UNKNOWN: cached records are missing source_sha256. "
+                         "Re-extract an audited cache before reporting held-out SVM metrics")
     models = {}
     gamma = args.gamma if args.gamma in {"scale", "auto"} else float(args.gamma)
     for axis, column in zip("GTR", range(3)):
@@ -167,22 +171,29 @@ def evaluate(args):
     if metadata["config"] != bundle["feature_config"]:
         raise ValueError("Feature configuration differs from saved model")
     records = metadata["records"]
+    source_separation = None
     if args.all_samples:
         indices = np.arange(len(records))
         role = "all_samples_including_training_not_held_out"
     else:
         if file_sha256(args.features) != bundle["feature_cache_sha256"]:
             raise ValueError("Feature cache bytes differ from the cache bound to the saved split")
-        expected = {row["id"]: row["source_sha256"] for row in bundle["source_records"]}
-        current = {row["id"]: row["source_sha256"] for row in records}
+        expected = {row["id"]: row.get("source_sha256") for row in bundle["source_records"]}
+        current = {row["id"]: row.get("source_sha256") for row in records}
         if current != expected:
             raise ValueError("Cached source IDs/hashes differ from saved split; refusing a misleading held-out score")
         by_id = {row["id"]: i for i, row in enumerate(records)}
+        source_separation = verify_source_separation(records,
+            [by_id[sample_id] for sample_id in bundle["split"]["train_ids"]],
+            [by_id[sample_id] for sample_id in bundle["split"]["test_ids"]])
+        if source_separation["status"] != "VERIFIED_NO_SHARED_SOURCE_SHA256":
+            raise ValueError("Saved held-out source separation is UNKNOWN: missing cached source_sha256")
         indices = np.asarray([by_id[sample_id] for sample_id in bundle["split"]["test_ids"]])
         role = "saved_held_out_test"
     return {"status": "EVALUATED_SAVED_MODEL", "evaluation_role": role,
             "samples": len(indices), "metrics": metrics(bundle["models"], x[indices], labels[indices]),
             "model_sha256": file_sha256(args.model), "features_sha256": file_sha256(args.features),
+            "source_separation": source_separation,
             "paper_exact_reproduction": False}
 
 

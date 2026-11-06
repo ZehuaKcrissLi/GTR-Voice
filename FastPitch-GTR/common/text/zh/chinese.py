@@ -26,6 +26,7 @@
 # *****************************************************************************
 
 import re
+from pathlib import Path
 
 from pypinyin import lazy_pinyin, Style
 
@@ -40,8 +41,10 @@ chinese_punctuations = "，。？！；：、‘’“”（）【】「」《�
 valid_symbols += tones
 
 
-def load_pinyin_dict(path="common/text/zh/pinyin_dict.txt"):
-    with open(path) as f:
+def load_pinyin_dict(path=None):
+    if path is None:
+        path = Path(__file__).with_name("pinyin_dict.txt")
+    with open(path, encoding="utf-8") as f:
         return {l.split()[0]: l.split()[1:] for l in f}
 
 pinyin_dict = load_pinyin_dict()
