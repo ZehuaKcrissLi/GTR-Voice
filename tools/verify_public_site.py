@@ -7,6 +7,7 @@ artifact upload or download retry. The original ZIP is downloaded only here.
 from __future__ import annotations
 
 import asyncio
+import argparse
 import base64
 from datetime import datetime, timezone
 import hashlib
@@ -44,6 +45,120 @@ def emit(event, **fields):
 def require(condition, message):
     if not condition:
         raise AssertionError(message)
+
+
+def assemble_media_ranges(parts):
+    """Join only captured browser bytes; reject inconsistent totals/overlaps."""
+    if not parts:
+        return None, {"captured_ranges": [], "covered_bytes": 0, "total_bytes": None}
+    totals = {part["total"] for part in parts}
+    require(len(totals) == 1, "Media responses disagree about total byte length")
+    total = totals.pop()
+    require(0 < total <= 32 * 1024 * 1024, "Unexpected media resource byte length")
+    runs = []
+    for part in sorted(parts, key=lambda item: item["start"]):
+        start, raw = part["start"], part["body"]
+        require(raw and 0 <= start < total and start + len(raw) <= total and
+                part["end"] == start + len(raw) - 1, "Invalid captured media interval")
+        if not runs or start > runs[-1][0] + len(runs[-1][1]):
+            runs.append((start, bytearray(raw)))
+            continue
+        run_start, buffer = runs[-1]
+        offset = start - run_start
+        overlap = min(len(raw), len(buffer) - offset)
+        require(buffer[offset:offset + overlap] == raw[:overlap],
+                "Overlapping browser media response bytes disagree")
+        buffer.extend(raw[overlap:])
+    evidence = {"total_bytes": total, "covered_bytes": sum(len(raw) for _, raw in runs),
+                "captured_ranges": [{key: part[key] for key in ("start", "end", "total", "status")}
+                                    for part in parts], "overlap_consistency_verified": True}
+    complete = len(runs) == 1 and runs[0][0] == 0 and len(runs[0][1]) == total
+    return bytes(runs[0][1]) if complete else None, evidence
+
+
+class BrowserMediaCapture:
+    """Observe real media responses from BEFORE navigation, including preload."""
+    def __init__(self, page):
+        self.page, self.parts, self.errors, self.tasks = page, {}, {}, set()
+        self.pending, self.fatal = {}, {}
+        self.closed = False
+        page.on("response", self.observed)
+
+    def observed(self, response):
+        parsed = urlsplit(response.url)
+        if (self.closed or parsed.scheme + "://" + parsed.netloc != ORIGIN or
+                not parsed.path.lower().endswith(".wav") or response.request.resource_type != "media"):
+            return
+        task = asyncio.create_task(self.capture(response))
+        self.tasks.add(task)
+        self.pending.setdefault(response.url, set()).add(task)
+        task.add_done_callback(self.tasks.discard)
+        task.add_done_callback(self.pending[response.url].discard)
+
+    async def capture(self, response):
+        url = response.url
+        try:
+            require(response.status in (200, 206), f"PUBLIC_AUDIO_MEDIA_HTTP_{response.status}")
+            completion = await asyncio.wait_for(response.finished(), timeout=25)
+            if completion is not None:
+                raise RuntimeError("Browser media response did not finish successfully: " + str(completion))
+            raw = await response.body()
+            declared = response.headers.get("content-length")
+            require(not declared or int(declared) == len(raw), "Captured media body length differs from header")
+            if response.status == 206:
+                match = re.fullmatch(r"bytes (\d+)-(\d+)/(\d+)", response.headers.get("content-range", ""))
+                require(match is not None, "Missing/invalid media Content-Range")
+                start, end, total = map(int, match.groups())
+                require(0 <= start <= end < total and len(raw) == end - start + 1,
+                        "Captured media bytes do not match declared range")
+            else:
+                require(not response.headers.get("content-range"), "HTTP 200 unexpectedly declares a partial range")
+                start, end, total = 0, len(raw) - 1, len(raw)
+            require(0 < total <= 32 * 1024 * 1024, "Unexpected media resource byte length")
+            self.parts.setdefault(url, []).append({"start": start, "end": end, "total": total,
+                                                   "status": response.status, "body": raw})
+        except asyncio.CancelledError:
+            raise
+        except AssertionError as error:
+            self.fatal.setdefault(url, []).append(error_text(error))
+            self.errors.setdefault(url, []).append(error_text(error))
+        except Exception as error:
+            self.errors.setdefault(url, []).append(error_text(error))
+
+    def available(self, url):
+        require(not self.fatal.get(url), "Invalid observed browser media response: " + json.dumps(self.fatal.get(url, [])))
+        return assemble_media_ranges(self.parts.get(url, []))
+
+    async def settle_preload(self, url):
+        # Do not abort an already observed metadata response by immediately
+        # calling load(). Retain its prefix before permitting a browser reload.
+        pending = list(self.pending.get(url, []))
+        if pending:
+            await asyncio.wait(pending, timeout=8)
+
+    async def complete(self, url, seconds=30):
+        deadline = asyncio.get_running_loop().time() + seconds
+        version, result = -1, (None, {})
+        while asyncio.get_running_loop().time() < deadline:
+            require(not self.fatal.get(url), "Invalid observed browser media response: " + json.dumps(self.fatal.get(url, [])))
+            parts = self.parts.get(url, [])
+            if len(parts) != version:
+                version = len(parts)
+                result = assemble_media_ranges(parts)
+                if result[0] is not None:
+                    return result
+            await asyncio.sleep(.1)
+        raise AssertionError("Incomplete observed browser media coverage: " + json.dumps({
+            **result[1], "capture_errors": self.errors.get(url, [])}))
+
+    async def close(self):
+        self.closed = True
+        self.page.remove_listener("response", self.observed)
+        pending = list(self.tasks)
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
 
 
 async def challenge_check(page):
@@ -211,11 +326,15 @@ async def graph(context):
         require(points == 125, "Rendered graph data is not the original 125 points")
         await page.locator(".plotly-graph-div").evaluate("""p => {
           window.__publicVerifierHover=null;
+          window.__publicVerifierClick={sequence:0,src:null};
           p.on('plotly_hover', e => { window.__publicVerifierHover=e.points[0].customdata[0]; });
           p.on('plotly_unhover', () => { window.__publicVerifierHover=null; });
+          p.on('plotly_click', e => { window.__publicVerifierClick={
+            sequence:window.__publicVerifierClick.sequence+1,
+            src:new URL(e.points[0].customdata[0],location.href).href}; });
         }""")
         box = await page.locator(".plotly-graph-div").bounding_box()
-        clicked = False
+        clicked, attempts = False, 0
         # Listen to real Plotly hover events while moving the real pointer.
         # Do not emit a plotly_click or assign the player's source to fake a hit.
         for y in range(70, min(int(box["height"]) - 30, 470), 22):
@@ -224,15 +343,31 @@ async def graph(context):
                 await page.wait_for_timeout(25)
                 hovered = await page.evaluate("window.__publicVerifierHover")
                 if hovered and not hovered.endswith("/010/18.wav"):
+                    before_click = await page.evaluate("window.__publicVerifierClick.sequence")
                     await page.mouse.click(box["x"] + x, box["y"] + y)
-                    clicked = True
+                    attempts += 1
+                    try:
+                        await page.wait_for_function("""previous => {
+                          const click=window.__publicVerifierClick;
+                          const audio=document.querySelector('#gtr-graph-audio');
+                          return click.sequence>previous && click.src &&
+                            !click.src.endsWith('/010/18.wav') && audio.src===click.src &&
+                            audio.currentSrc===click.src && !audio.paused && audio.currentTime>0.1;
+                        }""", arg=before_click, timeout=1500)
+                        clicked = True
+                        break
+                    except Exception:
+                        pass  # bounded next real point, never synthetic click/source assignment
+                if attempts >= 8:
                     break
-            if clicked:
+            if clicked or attempts >= 8:
                 break
         require(clicked, "GRAPH_RENDER_OR_HIT_TEST_UNAVAILABLE: no real point hover/click; no bypass attempted")
         result = await media_probe(page, page.locator("#gtr-graph-audio"), already_playing=True, test_drag=True)
         return {"passed": result["physical_drag_verified"], "scatter3d_points": points,
-                "point_click": "real_pointer_after_observed_plotly_hover",
+                "point_click": "real_pointer_with_observed_plotly_click_and_matching_playing_src",
+                "physical_click_attempts": attempts,
+                "observed_click": await page.evaluate("window.__publicVerifierClick"),
                 "player": result, "physical_drag_verified": result["physical_drag_verified"]}
     finally:
         await page.close()
@@ -240,38 +375,25 @@ async def graph(context):
 
 async def evaluation(context, path):
     page = await context.new_page()
+    capture = BrowserMediaCapture(page)  # installed before navigation/autopreload
     try:
         await navigate(page, path)
         require(await page.locator("table audio").count() == 72, "Evaluation does not contain 72 stimuli")
         sources = await page.locator("table audio").evaluate_all("items=>items.map(a=>a.src)")
         require(all(public_url(url).startswith(ORIGIN + "/") for url in sources), "Evaluation audio left origin")
-        # CSP correctly forbids fetch via connect-src 'none'. Trigger the real
-        # DOM media loader instead (media-src permits this), then capture that
-        # browser response. No API client, CSP override or altered UA is used.
+        # Retain initial browser metadata prefixes and subsequent real ranges.
+        # A cached complete capture needs no new response. No API, cache-busting
+        # URL, fabricated range request, CSP override or altered UA is used.
         semaphore = asyncio.Semaphore(4)
         async def decode_public_resource(index, url):
             async with semaphore:
                 try:
                     audio = page.locator("table audio").nth(index)
-                    async with page.expect_response(
-                        lambda response: response.url == url and response.request.resource_type == "media",
-                        timeout=15_000,
-                    ) as loaded:
+                    await capture.settle_preload(url)
+                    raw, coverage = capture.available(url)
+                    if raw is None:
                         await audio.evaluate("a => { a.preload='auto'; a.load(); }")
-                    response = await loaded.value
-                    require(response.status in (200, 206),
-                            f"PUBLIC_AUDIO_MEDIA_HTTP_{response.status}; no challenge bypass attempted")
-                    completion = await asyncio.wait_for(response.finished(), timeout=20)
-                    require(completion is None, "Media response did not finish successfully")
-                    raw = await response.body()
-                    if response.status == 206:
-                        match = re.fullmatch(r"bytes (\d+)-(\d+)/(\d+)",
-                                             response.headers.get("content-range", ""))
-                        require(match and int(match[1]) == 0 and
-                                int(match[2]) + 1 == int(match[3]) == len(raw),
-                                "Observed media range does not cover the complete audio file; no supplemental request made")
-                    declared = response.headers.get("content-length")
-                    require(not declared or int(declared) == len(raw), "Incomplete media response body")
+                        raw, coverage = await capture.complete(url)
                     require(raw[:4] == b"RIFF" and raw[8:12] == b"WAVE",
                             "PUBLIC_AUDIO_NOT_WAV_OR_CHALLENGE; no bypass attempted")
                     decoded_audio = await page.evaluate("""async encoded => {
@@ -288,9 +410,8 @@ async def evaluation(context, path):
                       } finally { await ctx.close(); }
                     }""", base64.b64encode(raw).decode("ascii"))
                     return {"path": urlsplit(url).path, "passed": True,
-                            "http_status": response.status, "bytes": len(raw),
-                            "request_range": response.request.headers.get("range"),
-                            "content_range": response.headers.get("content-range"),
+                            "bytes": len(raw), "browser_range_coverage": coverage,
+                            "other_capture_errors": capture.errors.get(url, []),
                             "complete_body_verified": True, **decoded_audio}
                 except Exception as error:
                     return {"path": urlsplit(url).path, "passed": False, "error": error_text(error)}
@@ -303,10 +424,11 @@ async def evaluation(context, path):
         failures = [item for item in decoded if not item["passed"]]
         return {"passed": not failures and player_error is None and bool(player and player["physical_drag_verified"]), "page": path,
                 "stimuli": len(sources), "browser_decoded": sum(item["passed"] for item in decoded),
-                "resource_transport": "actual DOM HTMLMediaElement.load browser media response; not fetch/API client",
+                "resource_transport": "actual browser preload/load response ranges, contiguous complete bytes; not fetch/API client",
                 "decoder": "Chromium AudioContext.decodeAudioData", "page_csp_unchanged": True,
                 "decoded": decoded, "player": player, "player_error": player_error}
     finally:
+        await capture.close()
         await page.close()
 
 
@@ -348,7 +470,7 @@ async def dataset_download(context, scratch):
         await page.close()
 
 
-async def verify(scratch, report):
+async def verify(scratch, report, *, media_only=False):
     from playwright.async_api import async_playwright
     network, legacy = [], []
     async with async_playwright() as playwright:
@@ -375,11 +497,17 @@ async def verify(scratch, report):
             # Complete the single ZIP attempt early, so a later WebGL/media
             # environment failure cannot discard download evidence.
             checks = [("homepage_and_guide", 90, lambda: homepage(context)),
-                      ("complete_dataset_download", 420, lambda: dataset_download(context, scratch)),
                       ("comparison_audio", 180, lambda: comparisons(context, network)),
                       ("graph_click_and_timeline", 60, lambda: graph(context)),
                       ("fastpitch_evaluation", 120, lambda: evaluation(context, "/fspt/evaluation_1.html")),
                       ("styletts_evaluation", 120, lambda: evaluation(context, "/stts/evaluation_22.html"))]
+            if media_only:
+                report["checks"]["complete_dataset_download"] = {
+                    "status": "SKIPPED_MEDIA_ONLY", "passed": None, "download_attempts": 0,
+                    "reason": "This run supplies no ZIP download proof; retain separate previously verified evidence"}
+                emit("check_skipped", check="complete_dataset_download", reason="media_only")
+            else:
+                checks.insert(1, ("complete_dataset_download", 420, lambda: dataset_download(context, scratch)))
             for name, seconds, action in checks:
                 emit("check_started", check=name)
                 try:
@@ -400,9 +528,14 @@ async def verify(scratch, report):
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--media-only", action="store_true",
+                        help="Skip ZIP transfer explicitly; success is PASS_MEDIA_ONLY, never a full-download PASS")
+    args = parser.parse_args()
     report = {"schema_version": 1, "started_utc": datetime.now(timezone.utc).isoformat(),
               "origin": ORIGIN, "scope": "fresh disposable Chromium; public resources only",
               "checks": {}, "failures": [], "physical_drag_verified": False,
+              "verification_mode": "media_only" if args.media_only else "full",
               "human_listening_quality_rated": False}
     temporary = None
     try:
@@ -420,11 +553,12 @@ def main():
         emit("platform_preflight", **report["platform"])
         temporary = tempfile.TemporaryDirectory(prefix="gtr-public-browser-")
         scratch = Path(temporary.name)
-        require(shutil.disk_usage(scratch).free >= 3 * ZIP_BYTES + 1024 ** 3,
+        minimum = 256 * 1024 ** 2 if args.media_only else 3 * ZIP_BYTES + 1024 ** 3
+        require(shutil.disk_usage(scratch).free >= minimum,
                 "Insufficient ephemeral runner space for browser and saved ZIP")
-        emit("ephemeral_storage_created", minimum_free_bytes=3 * ZIP_BYTES + 1024 ** 3)
+        emit("ephemeral_storage_created", minimum_free_bytes=minimum)
         async def bounded():
-            await asyncio.wait_for(verify(scratch, report), timeout=1000)
+            await asyncio.wait_for(verify(scratch, report, media_only=args.media_only), timeout=1000)
         asyncio.run(bounded())
     except Exception as error:
         report["failures"].append(error_text(error))
@@ -445,7 +579,9 @@ def main():
                 report["failures"].append("Temporary download cleanup failed")
             emit("cleanup", **report["cleanup"])
     expected = {"homepage_and_guide", "comparison_audio", "graph_click_and_timeline",
-                "fastpitch_evaluation", "styletts_evaluation", "complete_dataset_download"}
+                "fastpitch_evaluation", "styletts_evaluation"}
+    if not args.media_only:
+        expected.add("complete_dataset_download")
     for name in sorted(expected):
         if not report["checks"].get(name, {}).get("passed"):
             report["failures"].append(name)
@@ -458,7 +594,10 @@ def main():
         "styletts_evaluation": (report["checks"].get("styletts_evaluation", {}).get("player") or {}).get("physical_drag_verified", False),
     }
     report["physical_drag_verified"] = all(report["drag_checks"].values())
-    report["status"] = "PASS" if not report["failures"] and report.get("cleanup", {}).get("temporary_downloads_deleted") else "FAILED_OR_PARTIAL"
+    report["complete_dataset_download_verified_this_run"] = bool(
+        not args.media_only and report["checks"].get("complete_dataset_download", {}).get("passed"))
+    success = not report["failures"] and report.get("cleanup", {}).get("temporary_downloads_deleted")
+    report["status"] = ("PASS_MEDIA_ONLY" if args.media_only else "PASS") if success else "FAILED_OR_PARTIAL"
     report["finished_utc"] = datetime.now(timezone.utc).isoformat()
     emit("final_result", result=report)
     summary = os.environ.get("GITHUB_STEP_SUMMARY")
@@ -466,7 +605,7 @@ def main():
         with open(summary, "a", encoding="utf-8") as stream:
             stream.write("## GTR public browser verification: " + report["status"] + "\n\n```json\n")
             stream.write(json.dumps(report, ensure_ascii=False, indent=2) + "\n```\n")
-    return 0 if report["status"] == "PASS" else 1
+    return 0 if report["status"] in {"PASS", "PASS_MEDIA_ONLY"} else 1
 
 
 if __name__ == "__main__":
