@@ -204,65 +204,8 @@ class GTRStyleEncoder3(nn.Module):
 
 
 
-class GTRStyleEncoder(nn.Module):
-    def __init__(self, out_dim=128, style_dim=4):
-        super().__init__()
-        self.g_embedding = nn.Embedding(5, style_dim)
-        self.t_embedding = nn.Embedding(6, style_dim)
-        self.r_embedding = nn.Embedding(7, style_dim)
+from gtr_embedder import GTRStyleEncoder
 
-        self.lstm = nn.LSTM(style_dim * 3, out_dim, num_layers=2, batch_first=True, bidirectional=False),
-        self.lstm_fc = nn.Linear(out_dim // 2, out_dim),
-        
-        # # v0, style_dim = 7
-        # self.fc_sequnetial = nn.Sequential(
-        #     nn.Linear(style_dim * 3, (out_dim + style_dim * 3) // 2),
-        #     nn.ReLU(),
-        #     nn.Linear((out_dim + style_dim * 3) // 2, out_dim),
-        # )
-
-        # v1, style_dim = 4
-        self.fc_sequnetial = nn.Sequential(
-            nn.Linear(12, 48),
-            nn.ReLU(),
-            nn.Linear(48, 96),
-            nn.ReLU(),
-            nn.Linear(96, 128),
-        )
-
-        # v2, style_dim = 5
-        # self.fc_sequnetial = nn.Sequential(
-        #     nn.Linear(15, 75),
-        #     nn.ReLU(),
-        #     nn.Linear(75, 375),
-        #     nn.ReLU(),
-        #     nn.Linear(375, 128),
-        # )
-
-
-    def forward(self, x):
-        r = x % 10
-        t = (x // 10) % 10
-        g = (x // 100) % 10
-
-
-        g_embeded = self.g_embedding(g)
-        t_embeded = self.t_embedding(t)
-        r_embeded = self.r_embedding(r)
-        
-        x = torch.cat([g_embeded, t_embeded, r_embeded], axis=1)
-        
-        s = self.fc_sequnetial(x)
-
-        # self.lstm.flatten_parameters()  
-        # x = x.unsqueeze(1)          
-        # lstm_out, _ = self.lstm(x)
-        # s = self.lstm_fc(lstm_out.squeeze(1))
-        # norm = s.norm(p=2, dim=-1, keepdim=True) 
-        # s = s.div(norm)
-
-        return s
-    
 
 class LinearNorm(torch.nn.Module):
     def __init__(self, in_dim, out_dim, bias=True, w_init_gain='linear'):

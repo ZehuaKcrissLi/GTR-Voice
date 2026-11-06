@@ -37,7 +37,10 @@ import numpy as np
 import torch
 import torch.distributed as dist
 # import amp_C
-from apex.optimizers import FusedAdam, FusedLAMB
+try:
+    from apex.optimizers import FusedLAMB
+except ImportError:
+    FusedLAMB = None
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
@@ -51,13 +54,10 @@ from common.text import cmudict
 from common.utils import (BenchmarkStats, Checkpointer,
                           load_pretrained_weights, prepare_tmp)
 from fastpitch.attn_loss_function import AttentionBinarizationLoss
-from fastpitch.data_function import batch_to_gpu, ensure_disjoint, TTSCollate, TTSDataset
+from fastpitch.data_function import batch_to_gpu as move_batch, ensure_disjoint, TTSCollate, TTSDataset
 from fastpitch.loss_function import FastPitchLoss
 
-# set cuda device
-os.environ['CUDA_VISIBLE_DEVICES'] = '0'  #
-# set local rank
-os.environ['LOCAL_RANK'] = '0'
+# Respect scheduler-provided CUDA_VISIBLE_DEVICES and LOCAL_RANK.
 
 def parse_args(parser):
     parser.add_argument('-o', '--output', type=str, required=True,
@@ -105,7 +105,7 @@ def parse_args(parser):
                        help='Initialize model weights with a pre-trained ckpt')
 
     opt = parser.add_argument_group('optimization setup')
-    opt.add_argument('--optimizer', type=str, default='lamb',
+    opt.add_argument('--optimizer', type=str, default='adam',
                      help='Optimization algorithm')
     opt.add_argument('-lr', '--learning-rate', type=float, required=True,
                      help='Learing rate')
@@ -278,14 +278,17 @@ def apply_ema_decay(model, ema_model, decay):
 def init_multi_tensor_ema(model, ema_model):
     model_weights = list(model.state_dict().values())
     ema_model_weights = list(ema_model.state_dict().values())
-    ema_overflow_buf = torch.cuda.IntTensor([0])
+    ema_overflow_buf = None
     return model_weights, ema_model_weights, ema_overflow_buf
 
 
 def apply_multi_tensor_ema(decay, model_weights, ema_weights, overflow_buf):
-    amp_C.multi_tensor_axpby(
-        65536, overflow_buf, [ema_weights, model_weights, ema_weights],
-        decay, 1-decay, -1)
+    with torch.no_grad():
+        for current, averaged in zip(model_weights, ema_weights):
+            if averaged.is_floating_point():
+                averaged.mul_(decay).add_(current, alpha=1 - decay)
+            else:
+                averaged.copy_(current)
 
 
 def main():
@@ -333,7 +336,12 @@ def main():
                   ' multi-GPU data loading.')
             args.trainloader_repeats = 1
 
+    if args.pitch_std <= 0 or not np.isfinite(args.pitch_std):
+        raise ValueError('--pitch-std must be finite and positive')
     device = torch.device('cuda' if args.cuda else 'cpu')
+    if args.cuda and not torch.cuda.is_available():
+        raise RuntimeError('--cuda requested but CUDA is unavailable')
+    batch_to_gpu = lambda batch: move_batch(batch, device=device)
     model_config = models.get_model_config('FastPitch', args)
     model = models.get_model('FastPitch', model_config, device)
 
@@ -349,8 +357,10 @@ def main():
     kw = dict(lr=args.learning_rate, betas=(0.9, 0.98), eps=1e-9,
               weight_decay=args.weight_decay)
     if args.optimizer == 'adam':
-        optimizer = FusedAdam(model.parameters(), **kw)
+        optimizer = torch.optim.Adam(model.parameters(), **kw)
     elif args.optimizer == 'lamb':
+        if FusedLAMB is None:
+            raise RuntimeError('LAMB requires optional NVIDIA Apex; use --optimizer adam for the paper Adam setup')
         optimizer = FusedLAMB(model.parameters(), **kw)
     else:
         raise ValueError
@@ -404,16 +414,19 @@ def main():
     train_loader = RepeatedDataLoader(args.trainloader_repeats, trainset,
                                       shuffle=shuffle, drop_last=True,
                                       sampler=train_sampler, pin_memory=True,
-                                      persistent_workers=True, **kw)
+                                      persistent_workers=(args.num_workers > 0), **kw)
     val_loader = DataLoader(valset, shuffle=False, sampler=val_sampler,
                             pin_memory=False, **kw)
+    if len(train_loader) // args.grad_accumulation < 1:
+        raise ValueError('training set has no full optimization batch; reduce batch size/accumulation or supply more eligible data')
     if args.ema_decay:
         mt_ema_params = init_multi_tensor_ema(model, ema_model)
 
     model.train()
     bmark_stats = BenchmarkStats()
 
-    torch.cuda.synchronize()
+    if device.type == "cuda":
+        torch.cuda.synchronize()
     for epoch in range(start_epoch, args.epochs + 1):
         epoch_start_time = time.perf_counter()
 
@@ -528,10 +541,10 @@ def main():
                 iter_meta = {}
                 iter_start_time = time.perf_counter()
 
+                total_iter += 1
                 if epoch_iter == num_iters:
                     break
                 epoch_iter += 1
-                total_iter += 1
 
         # Finished epoch
         epoch_loss /= epoch_iter

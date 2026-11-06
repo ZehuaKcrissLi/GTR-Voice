@@ -1,0 +1,5 @@
+# Optional experiment; the paper SVM path does not need these model packages.
+# Direct dependency versions tested with Python 3.10.19; not a full lockfile.
+-r ../Acoustic-GTR/requirements-tested.txt
+torch==2.1.2
+transformers==4.36.2

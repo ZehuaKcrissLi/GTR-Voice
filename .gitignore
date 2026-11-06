@@ -1,0 +1,13 @@
+# Local environments, derived media, checkpoints and private study records
+.venv/
+__pycache__/
+.pytest_cache/
+*.py[cod]
+*.nb[ci]
+.DS_Store
+/runs/
+/models/
+/private-evidence/
+*.npz
+*.joblib
+# Do not add blanket *.wav / *.pt ignores: original tracked resources are retained.

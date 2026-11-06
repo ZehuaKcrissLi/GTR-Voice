@@ -147,7 +147,7 @@ class Generator(nn.Module):
         self.num_upsamples = len(conf.upsample_rates)
 
         self.conv_pre = weight_norm(
-            Conv1d(80, conf.upsample_initial_channel, 7, 1, padding=3))
+            Conv1d(conf.get('num_mels', 80), conf.upsample_initial_channel, 7, 1, padding=3))
 
         self.lrelu_slope = LRELU_SLOPE
 

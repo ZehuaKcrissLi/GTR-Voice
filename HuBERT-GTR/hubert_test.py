@@ -1,36 +1,35 @@
-import torch
-import torch.nn.functional as F
-import soundfile as sf
+"""Explicit optional encoder probe; importing this file never downloads a model."""
+import argparse
+from pathlib import Path
 
-from transformers import (
-    Wav2Vec2FeatureExtractor,
-    HubertModel,
-)
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-torch.cuda.set_device(2)
-model_path="TencentGameMate/chinese-hubert-large"
-wav_path="/home/kcriss/artivoice/hubert_gtr/test.wav"
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--model-path", required=True)
+    parser.add_argument("--wav", type=Path, required=True)
+    parser.add_argument("--device", default="cpu")
+    access = parser.add_mutually_exclusive_group()
+    access.add_argument("--local-files-only", dest="local_files_only", action="store_true",
+                        help="Use local/cached model files only (default)")
+    access.add_argument("--allow-download", dest="local_files_only", action="store_false",
+                        help="Explicitly allow Hugging Face model downloads")
+    parser.set_defaults(local_files_only=True)
+    return parser.parse_args(argv)
 
-feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained(model_path)
-model = HubertModel.from_pretrained(model_path)
 
-model = model.to(device)
-model = model.half()
-model.eval()
+def main(argv=None):
+    args = parse_args(argv)
+    import librosa
+    import torch
+    from transformers import HubertModel, Wav2Vec2FeatureExtractor
+    audio, _ = librosa.load(args.wav, sr=16000, mono=True)
+    extractor = Wav2Vec2FeatureExtractor.from_pretrained(args.model_path, local_files_only=args.local_files_only)
+    model = HubertModel.from_pretrained(args.model_path, local_files_only=args.local_files_only).to(args.device).eval()
+    inputs = extractor(audio, sampling_rate=16000, return_tensors="pt").input_values.to(args.device)
+    with torch.no_grad():
+        values = model(inputs).last_hidden_state
+    print({"shape": list(values.shape), "finite": bool(torch.isfinite(values).all()), "device": str(values.device)})
 
-wav, sr = sf.read(wav_path)
-input_values = feature_extractor(wav, return_tensors="pt").input_values
-input_values = input_values.half()
-input_values = input_values.to(device)
 
-with torch.no_grad():
-    outputs = model(input_values, output_hidden_states=True).hidden_states
-    
-# for idx, tensor in enumerate(outputs):
-#     print(f"Tensor {idx} shape: {tensor.shape}")
-    
-
-# hidden_states_tensor = torch.stack(outputs)
-# print(f"Hidden states tensor shape: {hidden_states_tensor.size()}")
-print(outputs)
+if __name__ == "__main__":
+    main()

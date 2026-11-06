@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "name": "provisional_legacy_id_ranges",
+  "paper_mapping_confirmed": false,
+  "notes": "Explicit compatibility mapping; the paper describes20pages per model, not proof that every later recovered ID belongs to its original study population.",
+  "ranges": [
+    {"start": 1, "end": 20, "model": "FastPitch"},
+    {"start": 21, "end": 50, "model": "StyleTTS"}
+  ]
+}

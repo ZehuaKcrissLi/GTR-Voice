@@ -67,24 +67,26 @@ def mel_spectrogram(y, n_fft, num_mels, sampling_rate, hop_size, win_size,
         print('max value is ', torch.max(y))
 
     global mel_basis, hann_window
-    fmax_key = f'{fmax}_{y.device}'
-    if fmax_key not in mel_basis:
-        mel = librosa_mel_fn(sampling_rate, n_fft, num_mels, fmin, fmax)
-        mel_basis[fmax_key] = torch.from_numpy(mel).float().to(y.device)
-        hann_window[str(y.device)] = torch.hann_window(win_size).to(y.device)
+    mel_key = (sampling_rate, n_fft, num_mels, fmin, fmax, str(y.device), str(y.dtype))
+    if mel_key not in mel_basis:
+        mel = librosa_mel_fn(sr=sampling_rate, n_fft=n_fft, n_mels=num_mels, fmin=fmin, fmax=fmax)
+        mel_basis[mel_key] = torch.from_numpy(mel).to(device=y.device, dtype=y.dtype)
+    window_key = (win_size, str(y.device), str(y.dtype))
+    if window_key not in hann_window:
+        hann_window[window_key] = torch.hann_window(win_size, device=y.device, dtype=y.dtype)
 
     pad = int((n_fft-hop_size)/2)
     y = F.pad(y.unsqueeze(1), (pad, pad), mode='reflect')
     y = y.squeeze(1)
 
     spec = torch.stft(y, n_fft, hop_length=hop_size, win_length=win_size,
-                      window=hann_window[str(y.device)], center=center,
+                      window=hann_window[window_key], center=center,
                       pad_mode='reflect', normalized=False, onesided=True,
                       return_complex=True)
 
     spec = torch.view_as_real(spec)
     spec = torch.sqrt(spec.pow(2).sum(-1)+(1e-9))
-    spec = torch.matmul(mel_basis[str(fmax)+'_'+str(y.device)], spec)
+    spec = torch.matmul(mel_basis[mel_key], spec)
     spec = dynamic_range_compression(spec)  # spectral normalize
     return spec
 

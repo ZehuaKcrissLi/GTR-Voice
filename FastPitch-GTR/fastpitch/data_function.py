@@ -48,7 +48,7 @@ import pathlib
 from tqdm import tqdm
 
 import common.layers as layers
-from common.text.text_processing import get_text_processing
+from fastpitch.gtr import from_path as gtr_from_path
 from common.utils import load_wav_to_torch, load_filepaths_and_text, to_gpu
 
 
@@ -89,7 +89,8 @@ def beta_binomial_prior_distribution(phoneme_count, mel_count, scaling=1.0):
 
 
 def estimate_pitch(wav, mel_len, method='pyin', normalize_mean=None,
-                   normalize_std=None, n_formants=1):
+                   normalize_std=None, n_formants=1, sampling_rate=24000,
+                   hop_length=256, frame_length=1024):
 
     if type(normalize_mean) is float or type(normalize_mean) is list:
         normalize_mean = torch.tensor(normalize_mean)
@@ -98,16 +99,18 @@ def estimate_pitch(wav, mel_len, method='pyin', normalize_mean=None,
         normalize_std = torch.tensor(normalize_std)
 
     if method == 'pyin':
-        sr = 24000
-        snd, sr = librosa.load(wav, sr=24000)
+        snd, sr = librosa.load(wav, sr=sampling_rate)
 
         pitch_mel, voiced_flag, voiced_probs = librosa.pyin(
             snd, fmin=librosa.note_to_hz('C2'),
-            fmax=librosa.note_to_hz('C7'), frame_length=1024)
-        assert np.abs(mel_len - pitch_mel.shape[0]) <= 1.0
+            fmax=librosa.note_to_hz('C7'), sr=sr,
+            frame_length=frame_length, hop_length=hop_length)
+        if abs(mel_len - pitch_mel.shape[0]) > 1:
+            raise ValueError('pitch/mel frame counts differ by more than one')
 
         pitch_mel = np.where(np.isnan(pitch_mel), 0.0, pitch_mel)
         pitch_mel = torch.from_numpy(pitch_mel).unsqueeze(0)
+        pitch_mel = pitch_mel[..., :mel_len]
         pitch_mel = F.pad(pitch_mel, (0, mel_len - pitch_mel.size(1)))
 
         if n_formants > 1:
@@ -176,21 +179,24 @@ def mel_spectrogram(y, n_fft, num_mels, sampling_rate, hop_size, win_size, fmin,
         print('max value is ', torch.max(y))
 
     global mel_basis, hann_window
-    if fmax not in mel_basis:
-        mel = librosa_mel_fn(sampling_rate, n_fft, num_mels, fmin, fmax)
-        mel_basis[str(fmax)+'_'+str(y.device)] = torch.from_numpy(mel).float().to(y.device)
-        hann_window[str(y.device)] = torch.hann_window(win_size).to(y.device)
+    key = (sampling_rate, n_fft, num_mels, fmin, fmax, str(y.device), str(y.dtype))
+    if key not in mel_basis:
+        mel = librosa_mel_fn(sr=sampling_rate, n_fft=n_fft, n_mels=num_mels, fmin=fmin, fmax=fmax)
+        mel_basis[key] = torch.from_numpy(mel).float().to(y.device)
+    window_key = (win_size, str(y.device), str(y.dtype))
+    if window_key not in hann_window:
+        hann_window[window_key] = torch.hann_window(win_size, device=y.device, dtype=y.dtype)
 
     y = torch.nn.functional.pad(y.unsqueeze(1), (int((n_fft-hop_size)/2), int((n_fft-hop_size)/2)), mode='reflect')
     y = y.squeeze(1)
 
     # complex tensor as default, then use view_as_real for future pytorch compatibility
-    spec = torch.stft(y, n_fft, hop_length=hop_size, win_length=win_size, window=hann_window[str(y.device)],
+    spec = torch.stft(y, n_fft, hop_length=hop_size, win_length=win_size, window=hann_window[window_key],
                       center=center, pad_mode='reflect', normalized=False, onesided=True, return_complex=True)
     spec = torch.view_as_real(spec)
     spec = torch.sqrt(spec.pow(2).sum(-1)+(1e-9))
 
-    spec = torch.matmul(mel_basis[str(fmax)+'_'+str(y.device)], spec)
+    spec = torch.matmul(mel_basis[key], spec)
     spec = spectral_normalize_torch(spec)
 
     return spec
@@ -227,6 +233,7 @@ class TTSDataset(torch.utils.data.Dataset):
                  betabinomial_online_dir=None,
                  use_betabinomial_interpolator=True,
                  pitch_online_method='pyin',
+                 gtr_emb=True,
                  **ignored):
 
         # Expect a list of filenames
@@ -238,6 +245,8 @@ class TTSDataset(torch.utils.data.Dataset):
             dataset_path, audiopaths_and_text,
             has_speakers=(n_speakers > 1))
         self.load_mel_from_disk = load_mel_from_disk
+        self.gtr_emb = gtr_emb
+        self.mel_config = (filter_length, n_mel_channels, sampling_rate, hop_length, win_length, mel_fmin, mel_fmax)
         if not load_mel_from_disk:
             self.max_wav_value = max_wav_value
             self.sampling_rate = sampling_rate
@@ -257,6 +266,7 @@ class TTSDataset(torch.utils.data.Dataset):
             'Only 0.0 and 1.0 p_arpabet is currently supported. '
             'Variable probability breaks caching of betabinomial matrices.')
 
+        from common.text.text_processing import get_text_processing
         self.tp = get_text_processing(symbol_set, text_cleaners, p_arpabet)
         self.n_speakers = n_speakers
         self.pitch_tmp_dir = pitch_online_dir
@@ -291,19 +301,10 @@ class TTSDataset(torch.utils.data.Dataset):
             audiopath, *extra, text = self.audiopaths_and_text[index]
             speaker = None
 
-        if len(audiopath.split('/')[-1].split('_')[0]) == 3:
-            gtr = audiopath.split('/')[-1].split('_')[0]
-            g = int(gtr[0])
-            t = int(gtr[1])
-            r = int(gtr[2])
-        elif 'SSB' in audiopath:
-            g = 2
-            t = 3
-            r = 1
+        if self.gtr_emb:
+            g, t, r = gtr_from_path(audiopath)
         else:
-            g = None
-            t = None
-            r = None
+            g = t = r = None
 
         mel = self.get_mel(audiopath)
         text = self.get_text(text)
@@ -356,14 +357,12 @@ class TTSDataset(torch.utils.data.Dataset):
             # if (audio.size(1) % 256) != 0:
             #     audio = audio[:, :-(audio.size(1) % 256)]
 
-            melspec = mel_spectrogram(audio, 1024, 100,
-                                  24000.0, 256, 1024, 0.0, 12000.0,
-                                  center=False)
+            melspec = mel_spectrogram(audio, *self.mel_config, center=False)
 
             melspec = torch.squeeze(melspec, 0)
 
         else:
-            melspec = torch.load(filename.replace('.wav', '.pt').replace('/wavs/', '/mels/'))
+            melspec = torch.load(filename.replace('.wav', '.pt').replace('/wavs/', '/mels/'), weights_only=True)
             # melspec = torch.load(filename)
 
             # assert melspec.size(0) == self.stft.n_mel_channels, (
@@ -396,7 +395,7 @@ class TTSDataset(torch.utils.data.Dataset):
             cached_fpath = Path(self.betabinomial_tmp_dir, fname)
 
             if cached_fpath.is_file():
-                return torch.load(cached_fpath)
+                return torch.load(cached_fpath, weights_only=True)
 
         attn_prior = beta_binomial_prior_distribution(text_len, mel_len)
 
@@ -416,7 +415,7 @@ class TTSDataset(torch.utils.data.Dataset):
 
         if self.load_pitch_from_disk:
             pitchpath = fields[0]
-            pitch = torch.load(pitchpath)
+            pitch = torch.load(pitchpath, weights_only=True)
             if self.pitch_mean is not None:
                 assert self.pitch_std is not None
                 pitch = normalize_pitch(pitch, self.pitch_mean, self.pitch_std)
@@ -427,7 +426,7 @@ class TTSDataset(torch.utils.data.Dataset):
             fname_method = fname.with_suffix('.pt')
             cached_fpath = Path(self.pitch_tmp_dir, fname_method)
             if cached_fpath.is_file():
-                return torch.load(cached_fpath)
+                return torch.load(cached_fpath, weights_only=True)
 
         # No luck so far - calculate
         wav = audiopath
@@ -436,7 +435,10 @@ class TTSDataset(torch.utils.data.Dataset):
             wav = re.sub('.pt$', '.wav', wav)
 
         pitch_mel = estimate_pitch(wav, mel_len, self.f0_method,
-                                   self.pitch_mean, self.pitch_std)
+                                   self.pitch_mean, self.pitch_std,
+                                   sampling_rate=self.mel_config[2],
+                                   hop_length=self.mel_config[3],
+                                   frame_length=self.mel_config[0])
 
         if self.pitch_tmp_dir is not None and not cached_fpath.is_file():
             cached_fpath.parent.mkdir(parents=True, exist_ok=True)
@@ -540,25 +542,26 @@ class TTSCollate:
                 audiopaths, g, t, r)
 
 
-def batch_to_gpu(batch):
+def batch_to_gpu(batch, device=None):
+    move = to_gpu if device is None else lambda tensor: tensor.contiguous().to(device)
     (text_padded, input_lengths, mel_padded, output_lengths, len_x,
      pitch_padded, energy_padded, speaker, attn_prior, audiopaths, g, t, r) = batch
 
-    text_padded = to_gpu(text_padded).long()
-    input_lengths = to_gpu(input_lengths).long()
-    mel_padded = to_gpu(mel_padded).float()
-    output_lengths = to_gpu(output_lengths).long()
-    pitch_padded = to_gpu(pitch_padded).float()
-    energy_padded = to_gpu(energy_padded).float()
-    attn_prior = to_gpu(attn_prior).float()
+    text_padded = move(text_padded).long()
+    input_lengths = move(input_lengths).long()
+    mel_padded = move(mel_padded).float()
+    output_lengths = move(output_lengths).long()
+    pitch_padded = move(pitch_padded).float()
+    energy_padded = move(energy_padded).float()
+    attn_prior = move(attn_prior).float()
     if speaker is not None:
-        speaker = to_gpu(speaker).long()
+        speaker = move(speaker).long()
     if g is not None:
-        g = to_gpu(g).long()
+        g = move(g).long()
     if t is not None:
-        t = to_gpu(t).long()
+        t = move(t).long()
     if r is not None:
-        r = to_gpu(r).long()
+        r = move(r).long()
 
     # Alignments act as both inputs and targets - pass shallow copies
     x = [text_padded, input_lengths, mel_padded, output_lengths,

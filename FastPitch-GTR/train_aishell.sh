@@ -5,7 +5,7 @@ set -a
 PYTHONIOENCODING=utf-8
 
 # Mandarin & English bilingual
-ARGS+=" --symbol-set english_mandarin_basic"
+ARGS+=" --symbol-set english_mandarin_basic --no-gtr-emb"
 
 # Initialize weights with a pre-trained English model
 #bash scripts/download_models.sh fastpitch
@@ -24,4 +24,5 @@ AMP=false  # FP32 training for better stability
 : ${VAL_FILELIST:=filelists/aishell3_val.txt}
 : ${OUTPUT_DIR:=./output_aishell3_bigv}
 : ${NSPEAKERS:=200}
+: ${EPOCHS:=80}
 NUM_GPUS=1 GRAD_ACCUMULATION=2 BATCH_SIZE=16 bash scripts/train.sh $ARGS "$@"
