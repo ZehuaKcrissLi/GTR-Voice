@@ -31,66 +31,71 @@
   <img src="./assets/gtr_poster.png" alt="GTR-Voice"></a>
 </div>
 
-## 🗒 TODOs
-- [x] Release the Dataset.
-- [x] Build the Github Page.
-- [ ] Release pretrained weights.
-- [ ] Release training code.
+## Dataset and demo
 
-## ⚒️ Environment
-We recommend a python version ```>=3.9``` and cuda version ```=11.8```. It's possible to have other compatible version.
+[Interactive demo](https://gtr-voice.com/) · [Paper](https://arxiv.org/abs/2406.10514) · [Original dataset ZIP](https://github.com/ZehuaKcrissLi/GTR-Voice/releases/download/gtr-voice-dataset-v1/GTR-Voice.zip)
 
-```bash
-conda create -n gtr python=3.10
-conda activate gtr
-conda install pytorch==2.1.2 torchvision==0.16.2 torchaudio==2.1.2 pytorch-cuda=11.8 -c pytorch -c nvidia
-pip install -r requirements.txt
+The original ZIP is 1,044,673,451 bytes. SHA256:
+`d2b1301acbdeac7ca8e3808eae0d0f6396b9bb6c5afe4c84585c22a307c826e0`.
+It contains 2,500 recordings across 125 GTR labels and 20 utterances. Fourteen
+original files contain incomplete PCM frames; the download preserves their
+original bytes. Training preparation records these exclusions explicitly.
+
+## Runnable research paths
+
+This repository contains the original Interspeech 2024 implementations and
+repairs to their data preparation, training, inference and analysis entry points.
+Use the following guides instead of the historical notebook paths:
+
+| Path | Guide |
+|---|---|
+| Original audio integrity and clean manifests | [Dataset preparation](docs/reproduction.md#dataset-preparation) |
+| Twelve acoustic feature families and three SVM classifiers | [Acoustic-GTR](Acoustic-GTR/README.md) |
+| Mandarin FastPitch with GTR conditioning | [FastPitch-GTR](FastPitch-GTR/README.md) |
+| Frozen StyleTTS base and trainable GTR embedder | [StyleTTS-GTR](StyleTTS-GTR/README.md) |
+| Anonymous listening responses, MOS and control accuracy | [Evaluation statistics](evaluation/README.md) |
+| Optional HuBERT classifier extension | [HuBERT-GTR](HuBERT-GTR/README.md) |
+
+HuBERT is an additional repository experiment, not the paper's acoustic-SVM
+method. Original final paper checkpoints and the full original listening-study
+protocol are not distributed here. See [reproduction notes](docs/reproduction.md)
+for tested commands, measured results and the remaining scientific gaps.
+
+## Install and engineering checks
+
+Use Python 3.10 in an isolated environment. The root requirements describe the
+versions used for these repaired paths; retained upstream dependency files and
+old absolute-path data lists are historical references.
+
+```sh
+python3.10 -m venv .venv
+. .venv/bin/activate
+python -m pip install -r requirements.txt
 ```
 
-Now, get started with the following code:
+The pinned PyTorch 2.1.2 CPU path is supported. For NVIDIA GPU training, install
+matching PyTorch/torchaudio CUDA wheels as described by
+[PyTorch](https://pytorch.org/get-started/previous-versions/) before the remaining
+requirements. No import automatically downloads weights or starts training.
+StyleTTS text inference needs eSpeak-NG; an explicit loader option is documented
+in its guide.
 
-```bash
-cd inference
-CUDA_VISIBLE_DEVICES=0 python inference.py --wav_file ./assets/001.wav --init_frame ./assets/001.png
+Run each component separately because the original projects have overlapping
+module names:
+
+```sh
+python -m pytest -q tools/tests Acoustic-GTR/tests
+python -m pytest -q HuBERT-GTR/tests
+python -m pytest -q FastPitch-GTR/tests
+python -m pytest -q StyleTTS-GTR/tests
+python -m unittest discover -s evaluation/tests -p 'test_*.py' -v
 ```
 
-## 🔥 Train Your Own Model
-
-
-### Train StyleTTS
-Change into the ```styletts``` folder:
-
-```bash
-cd ../styletts
-```
-
-Run the following code to train StyleTTS stage 1
-
-```bash
-
-```
-
-Run the following code to train StyleTTS stage 2
-  
-```bash
-
-```
-
-
-### Train PastPitch
-Change into the ```image-warping``` folder:
-
-```bash
-cd fastpitch
-```
-
-Then run the following code to train fast-pitch:
-
-```bash 
-
-```
-
-
+These tests use small synthetic fixtures to check optimizer steps, strict
+checkpoint replay, conditioning, malformed inputs and statistical accounting.
+They do not measure human speech quality or reproduce the paper's benchmark
+numbers. Full-data commands and separately measured outcomes are documented in
+the [reproduction guide](docs/reproduction.md).
 
 ## 🙏 Acknowledgments
 

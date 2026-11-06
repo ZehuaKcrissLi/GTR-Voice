@@ -34,6 +34,8 @@ def parse_fastpitch_args(parent, add_help=False):
     """
     parser = argparse.ArgumentParser(parents=[parent], add_help=add_help,
                                      allow_abbrev=False)
+    parser.add_argument('--gtr-emb', action=argparse.BooleanOptionalAction, default=True,
+                        help='Enable GTR embeddings; disable explicitly for base pretraining')
     io = parser.add_argument_group('io parameters')
     io.add_argument('--n-mel-channels', default=100, type=int,
                     help='Number of bins in mel-spectrograms')

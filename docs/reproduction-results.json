@@ -1,0 +1,202 @@
+{
+  "schema_version": 1,
+  "date": "2026-11-06",
+  "scope": "Original Interspeech2024 research code; new derived runs with explicit protocols",
+  "dataset": {
+    "original_zip_sha256": "d2b1301acbdeac7ca8e3808eae0d0f6396b9bb6c5afe4c84585c22a307c826e0",
+    "original_zip_bytes": 1044673451,
+    "original_audio_count": 2500,
+    "eligible_audio_count": 2486,
+    "original_anomalies_preserved": 14,
+    "all_2500_zip_member_hashes_match_experiment_originals": true
+  },
+  "svm": [
+    {
+      "protocol": "stratified-seed42",
+      "training_samples": 1988,
+      "test_samples": 498,
+      "svm_config": {
+        "C": 0.1,
+        "gamma": 0.001,
+        "kernel": "rbf",
+        "scale": true
+      },
+      "accuracy": {
+        "G": 0.6104417670682731,
+        "T": 0.5301204819277109,
+        "R": 0.7670682730923695
+      },
+      "source_separation": {
+        "status": "VERIFIED_NO_SHARED_SOURCE_SHA256",
+        "identity_basis": "SHA256 stored by extraction; original sources are not reread during splitting",
+        "known_train_source_hashes": 1988,
+        "known_test_source_hashes": 498,
+        "known_shared_source_hashes": 0,
+        "missing_source_sha256_ids": {
+          "train": [],
+          "test": []
+        }
+      },
+      "feature_cache_sha256": "403eab5816248950aa272b0bd30436328d86db645023c1d0a19e0f316319269e",
+      "model_sha256": "8cf8eb61bd4cd7ecd3c1d333454e238f927060286b6043a243467bff6b031a11",
+      "exact_paper_reproduction": false
+    },
+    {
+      "protocol": "sentence-17-20",
+      "training_samples": 1990,
+      "test_samples": 496,
+      "svm_config": {
+        "C": 0.1,
+        "gamma": 0.001,
+        "kernel": "rbf",
+        "scale": true
+      },
+      "accuracy": {
+        "G": 0.5524193548387096,
+        "T": 0.5262096774193549,
+        "R": 0.7862903225806451
+      },
+      "source_separation": {
+        "status": "VERIFIED_NO_SHARED_SOURCE_SHA256",
+        "identity_basis": "SHA256 stored by extraction; original sources are not reread during splitting",
+        "known_train_source_hashes": 1990,
+        "known_test_source_hashes": 496,
+        "known_shared_source_hashes": 0,
+        "missing_source_sha256_ids": {
+          "train": [],
+          "test": []
+        }
+      },
+      "feature_cache_sha256": "403eab5816248950aa272b0bd30436328d86db645023c1d0a19e0f316319269e",
+      "model_sha256": "128379d2885f727c39f8fd526c4a2247697dc4548df71f47d5329194854f7873",
+      "exact_paper_reproduction": false
+    }
+  ],
+  "styletts": [
+    {
+      "architecture": "legacy",
+      "paper_description_dimensions_derived": false,
+      "epochs": 500,
+      "training_samples": 2239,
+      "validation_samples": 247,
+      "validation_utterances": [
+        "19",
+        "20"
+      ],
+      "split_original_paper": false,
+      "batch_size": 64,
+      "learning_rate": 0.001,
+      "seed": 1234,
+      "train_embedding_mse": 0.004646414425224066,
+      "held_out_embedding_mse": 0.005550471134483814,
+      "checkpoint_sha256": "b661c96f34da77adbb21cb28e68b0faad36be7370eed1ed6b981ec8a8bd44009",
+      "teacher_checkpoint_sha256": "40e717f9424e98eac14268df3572351826058dac767044c90bd863dd8eae4686",
+      "teacher_mel_device": "cpu",
+      "teacher_encoder_device": "mps",
+      "precision": "float32",
+      "waveforms": [
+        {
+          "gtr": "231",
+          "samples": 81600,
+          "sample_rate": 24000,
+          "sha256": "2e9fc60bd444132fe020e190017363deed6d61fa5027323bdcddb33024143ec9"
+        },
+        {
+          "gtr": "443",
+          "samples": 75000,
+          "sample_rate": 24000,
+          "sha256": "734d251ccca9e88b45c3f67076835d084c780cab8b3bfc7ad9c1ac4959522a24"
+        },
+        {
+          "gtr": "010",
+          "samples": 95400,
+          "sample_rate": 24000,
+          "sha256": "652e4dc9f2b937b6011c673a991baee26aa8430cda190f57115d6573da5cc8a6"
+        }
+      ],
+      "human_quality_measured": false
+    },
+    {
+      "architecture": "paper-described",
+      "paper_description_dimensions_derived": true,
+      "epochs": 500,
+      "training_samples": 2239,
+      "validation_samples": 247,
+      "validation_utterances": [
+        "19",
+        "20"
+      ],
+      "split_original_paper": false,
+      "batch_size": 64,
+      "learning_rate": 0.001,
+      "seed": 1234,
+      "train_embedding_mse": 0.004746300168335438,
+      "held_out_embedding_mse": 0.005603345576673746,
+      "checkpoint_sha256": "db1d19a801fa5bd13e46cf7f8b9eccdf3ce2375eaf96c3e1716c3a40f872d0f5",
+      "teacher_checkpoint_sha256": "40e717f9424e98eac14268df3572351826058dac767044c90bd863dd8eae4686",
+      "teacher_mel_device": "cpu",
+      "teacher_encoder_device": "mps",
+      "precision": "float32",
+      "waveforms": [
+        {
+          "gtr": "231",
+          "samples": 82800,
+          "sample_rate": 24000,
+          "sha256": "7493b01d0a53028fa806c2ddaec9f606ce7a28f58c65873a2523618c889f8ae4"
+        },
+        {
+          "gtr": "443",
+          "samples": 74400,
+          "sample_rate": 24000,
+          "sha256": "7171a3b2288fba3ec4b0c6a44738049a3478c588a54247ef952e658ee09e5338"
+        },
+        {
+          "gtr": "010",
+          "samples": 91200,
+          "sample_rate": 24000,
+          "sha256": "173fa60400b9432983ade5bbe05effb284e59706511b1ee50c462964ed0d6b40"
+        }
+      ],
+      "human_quality_measured": false
+    }
+  ],
+  "fastpitch": {
+    "engineering_train_save_resume_inference_verified": true,
+    "real_mandarin_sources_prepared_and_loaded": 3,
+    "real_compatible_bigvgan_reconstruction_verified": true,
+    "original_aishell3_and_final_gtr_weights_verified": false,
+    "paper_80_plus_3000_epoch_training_completed": false
+  },
+  "original_study_recalculation": {
+    "anonymous_response_records": 62,
+    "independent_participant_count": null,
+    "trials": 1140,
+    "implicit_exclusions": 0,
+    "FastPitch": {
+      "responses": 32,
+      "correct": 391,
+      "trials": 583,
+      "quality_mean": 3.04974271012,
+      "naturalness_mean": 3.14408233276
+    },
+    "StyleTTS": {
+      "responses": 30,
+      "correct": 317,
+      "trials": 557,
+      "quality_mean": 4.19928186715,
+      "naturalness_mean": 4.14003590664
+    },
+    "full_figure1_reproduced": false,
+    "original_60_person_cohort_confirmed": false,
+    "original_SD_aggregation_known": false
+  },
+  "original_human_label_cohort_confirmed": false,
+  "full_paper_numerical_and_perceptual_reproduction": false,
+  "public_styletts_base": {
+    "repository": "yl4579/StyleTTS",
+    "revision": "ad253ae1fa39031d8d2d847c9c5d0fd14dd7d155",
+    "model_archive_sha256": "f3b9657d255f886c5bd78822c1196302d0b855aa878723c5a1ca73ed30b1491f",
+    "vocoder_archive_sha256": "72968163f94cf10b9a99c63e65c39876e9346cf4548c6ac7c74f724722277c3d",
+    "checkpoint_paper_identity_confirmed": false
+  }
+}

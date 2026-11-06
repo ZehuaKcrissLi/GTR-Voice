@@ -32,7 +32,6 @@ import dllogger as DLLogger
 from dllogger import StdOutBackend, JSONStreamBackend, Verbosity
 
 import models
-from common import gpu_affinity
 from common.tb_dllogger import (init_inference_metadata, stdout_metric_format,
                                 unique_log_fpath)
 from common.text import cmudict
@@ -84,7 +83,7 @@ def parse_args(parser):
     parser.add_argument('--win-length', type=int, default=1024,
                         help='STFT win length for denoiser and mel loss')
     parser.add_argument('-sr', '--sampling-rate', default=22050, type=int,
-                        choices=[22050, 44100], help='Sampling rate')
+                        choices=[22050, 24000, 44100], help='Sampling rate')
     parser.add_argument('--max_wav_value', default=32768.0, type=float,
                         help='Maximum audiowave value')
     parser.add_argument('--amp', action='store_true',
@@ -112,7 +111,7 @@ def parse_args(parser):
     # add g t r label args
     parser.add_argument('--g', type=int, default=0,
                         help='G label')
-    parser.add_argument('--t', type=int, default=0,
+    parser.add_argument('--t', type=int, default=3,
                         help='T label')
     parser.add_argument('--r', type=int, default=0,
                         help='R label')
@@ -185,13 +184,13 @@ def prepare_input_sequence(fields, device, symbol_set, text_cleaners,
         assert 'mel' in fields
         assert dataset is not None
         fields['mel'] = [
-            torch.load(Path(dataset, fields['mel'][i])).t() for i in order]
+            torch.load(Path(dataset, fields['mel'][i]), weights_only=True).t() for i in order]
         fields['mel_lens'] = torch.LongTensor([t.size(0) for t in fields['mel']])
 
     if load_pitch:
         assert 'pitch' in fields
         fields['pitch'] = [
-            torch.load(Path(dataset, fields['pitch'][i])) for i in order]
+            torch.load(Path(dataset, fields['pitch'][i]), weights_only=True) for i in order]
         fields['pitch_lens'] = torch.LongTensor([t.size(0) for t in fields['pitch']])
 
     if 'output' in fields:
@@ -300,7 +299,10 @@ def main():
     parser = parse_args(parser)
     args, unk_args = parser.parse_known_args()
 
-    if args.affinity != 'disabled':
+    if args.cuda and not torch.cuda.is_available():
+        raise RuntimeError('--cuda requested but CUDA is unavailable')
+    if args.cuda and args.affinity != 'disabled':
+        from common import gpu_affinity
         nproc_per_node = torch.cuda.device_count()
         # print(nproc_per_node)
         affinity = gpu_affinity.set_affinity(
@@ -315,9 +317,9 @@ def main():
     torch.backends.cudnn.benchmark = args.cudnn_benchmark
 
     if args.output is not None:
-        Path(args.output).mkdir(parents=False, exist_ok=True)
+        Path(args.output).mkdir(parents=True, exist_ok=True)
 
-    log_fpath = args.log_file or str(Path('./log/', 'nvlog_infer.json'))
+    log_fpath = args.log_file or str(Path(args.output or '.', 'nvlog_infer.json'))
     DLLogger.init(backends=[
         JSONStreamBackend(Verbosity.DEFAULT, log_fpath, append=True),
         JSONStreamBackend(Verbosity.DEFAULT, unique_log_fpath(log_fpath)),
@@ -420,6 +422,9 @@ def main():
     #             audios = denoiser(audios.squeeze(1), args.denoising_strength)
     #         return audios.squeeze(1) * args.max_wav_value
 
+    if generator is not None and vocoder is not None and args.hifigan is not None:
+        if generator.proj.out_features != vocoder.conv_pre.in_channels:
+            raise ValueError('FastPitch/vocoder mel-channel mismatch; use the vocoder trained for this mel configuration')
     if len(unk_args) > 0:
         raise ValueError(f'Invalid options {unk_args}')
 
@@ -471,7 +476,7 @@ def main():
         with torch.no_grad():
             b = next(cycle)
             if generator is not None:
-                mel, *_ = generator(b['text'])
+                mel, *_ = generator(b['text'], **gen_kw)
             else:
                 mel, mel_lens = b['mel'], b['mel_lens']
                 if args.amp:
@@ -539,11 +544,14 @@ def main():
                         audio = audio[:mel_lens[i].item() * args.hop_length]
 
                         if args.fade_out:
-                            fade_len = args.fade_out * args.hop_length
+                            fade_len = min(len(audio), args.fade_out * args.hop_length)
                             fade_w = torch.linspace(1.0, 0.0, fade_len)
                             audio[-fade_len:] *= fade_w.to(audio.device)
 
-                        audio = audio / torch.max(torch.abs(audio))
+                        peak = torch.max(torch.abs(audio))
+                        if not torch.isfinite(audio).all() or peak <= 0:
+                            raise RuntimeError('vocoder produced non-finite or silent audio')
+                        audio = audio / peak
                         fname = b['output'][i] if 'output' in b else f'audio_{all_utterances + i}.wav'
                         audio_path = Path(args.output, fname)
                         print(args.sampling_rate)

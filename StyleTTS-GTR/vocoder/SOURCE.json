@@ -1,0 +1,21 @@
+{
+  "upstream_commit": "4c8f93ff7b9fdc21a99fe5af28c243ac1629c975",
+  "files": [
+    {
+      "source": "https://github.com/yl4579/StyleTTS/blob/4c8f93ff7b9fdc21a99fe5af28c243ac1629c975/Demo/hifi-gan/vocoder.py",
+      "git_blob_sha": "b9646d14ac5074aea6743bdaf3e3d3ace61e3c51",
+      "original_sha256": "9248f30ffd3673f1c222aad6ab735db2d4234f5abcb892c697fc899f0fcbf9ac",
+      "destination": "StyleTTS-GTR/vocoder/model.py",
+      "patched_sha256": "87353800ef92f221eb443948841943f041e0bd45db50d0c9e1b26de4316c36a2",
+      "modification": "Relative package import and source/license header only"
+    },
+    {
+      "source": "https://github.com/yl4579/StyleTTS/blob/4c8f93ff7b9fdc21a99fe5af28c243ac1629c975/Demo/hifi-gan/vocoder_utils.py",
+      "git_blob_sha": "aa2a536e6205ba4252b41bdfe05b491908b500be",
+      "original_sha256": "bd93329bf20c16d5226bd9e57d26b1a4afc453fb267081d810a8e0d4ddc73bed",
+      "destination": "StyleTTS-GTR/vocoder/utils.py",
+      "patched_sha256": "e4708786889a6252c5bfb94dfc3222a51717815ad7b9a4fc62e6a3c0f110ceaf",
+      "modification": "Relative package import and source/license header only"
+    }
+  ]
+}

@@ -58,7 +58,11 @@ def get_model(model_name, model_config, device, bn_uniform_init=False,
 
     if model_name == 'FastPitch':
         if jitable:
-            model = FastPitchJIT(**model_config)
+            if model_config.get('gtr_emb', True):
+                raise ValueError('GTR conditioning requires eager inference; controlled TorchScript export is not implemented')
+            config = dict(model_config)
+            config.pop('gtr_emb', None)
+            model = FastPitchJIT(**config)
         else:
             model = FastPitch(**model_config)
 
@@ -90,6 +94,7 @@ def get_model_config(model_name, args, ckpt_config=None):
         model_config = dict(
             # io
             n_mel_channels=args.n_mel_channels,
+            gtr_emb=args.gtr_emb,
             # symbols
             n_symbols=(len(get_symbols(args.symbol_set))
                        if args.symbol_set is not _missing else _missing),
@@ -149,10 +154,9 @@ def get_model_config(model_name, args, ckpt_config=None):
             with open(args.hifigan_config) as f:
                 args = AttrDict(json.load(f))
 
-        with open('pretrained_models/hifigan/LibriTTS/config.json', 'r') as f:
-            args = AttrDict(json.load(f))
         model_config = dict(
             # generator architecture
+            num_mels=args.get('num_mels', 80),
             upsample_rates=args.upsample_rates,
             upsample_kernel_sizes=args.upsample_kernel_sizes,
             upsample_initial_channel=args.upsample_initial_channel,
@@ -233,8 +237,9 @@ def load_model_from_ckpt(checkpoint_data, model, key='state_dict'):
 
 def load_and_setup_model(model_name, parser, checkpoint, amp, device,
                          unk_args=[], forward_is_infer=False, jitable=False):
+    ckpt_data = {}
     if checkpoint is not None:
-        ckpt_data = torch.load(checkpoint)
+        ckpt_data = torch.load(checkpoint, map_location="cpu", weights_only=True)
         print(f'{model_name}: Loading {checkpoint}...')
         ckpt_config = ckpt_data.get('config')
         if ckpt_config is None:
@@ -266,7 +271,6 @@ def load_and_setup_model(model_name, parser, checkpoint, amp, device,
         if model_name == 'FastPitch':
             missing = [k for k in missing if not k.startswith('attention.')]
             unexpected = [k for k in unexpected if not k.startswith('attention.')]
-            unexpected = [k for k in unexpected if k not in {'g_emb.weight', 't_emb.weight', 'r_emb.weight'}]
 
         assert len(missing) == 0 and len(unexpected) == 0, (
             f'Mismatched keys when loading parameters. Missing: {missing}, '

@@ -1,0 +1,3 @@
+# Core parsing, MOS and ledgers use only the Python standard library.
+# Optional category chi-square tests:
+scipy>=1.10,<2

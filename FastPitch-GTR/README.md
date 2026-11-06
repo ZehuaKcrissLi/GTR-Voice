@@ -1,20 +1,64 @@
-# Reproduce GTR-Voice Fastpitch
+# FastPitch-GTR: explicit restoration pipeline
 
-## Pretrain AISHELL3, pretrained checkpoint provided, you can omit this phase
-1. Download AISHELL3
-2. run prepare_dataset_aishell.sh, replace filelist path with AISHELL3 filelist, replace data path to AISHELL3 folder
-3. run train_aishell.sh, pretrain fastpitch with AISHELL3
+The GTR branch now supports original `label/utterance.wav` paths (including `010/04.wav`), validated G/T/R controls, CPU execution for engineering checks, explicit base pretraining (`--no-gtr-emb`), ordinary PyTorch Adam, and strict GTR checkpoint loading. No device assignment, credentials or model downloads are performed implicitly. Missing CMU dictionaries fail with a nonzero error and never write the checkout; supply existing dictionary paths for `--p-arpabet 1`, or use `--p-arpabet 0`.
 
-## finetune GTR voice
-1. construct GTR data folder like AISHELL3 structure
-2. run prepare_dataset_gtr.sh , replace filelist path and data path to yours
-3. run finetune.sh, replace pretrained checkpoint and other path to yours 
+## Paper contract and current asset boundary
 
-## Vocoder and Inference
-You can just use pretrained checkpoint of hifi-gan or BigVGAN from their official repos. Then inference using inference_gtr.sh or 
-inference_gtr_bigv.sh
+The paper pretrains FastPitch on **AISHELL3 for 80 epochs**, then fine tunes the whole network on GTR-Voice for **3000 epochs**, with 384-dimensional G/T/R embeddings, Adam learning rate 0.01, weight decay 1e-6 and batch size 32. The released scripts use a 200-speaker AISHELL3 base and speaker 199 for this speaker. Use a compatible, identified AISHELL3 checkpoint; an English NVIDIA checkpoint or random tiny fixture is not the paper base. No original final paper-quality GTR checkpoint is included here.
 
-## If you not sure about the process, I recommand you look at the official mandarin example from Fastpitch first. And also feel free to leave an issue or email us for questions.
+The released default feature grid is **100 mel channels, 24 kHz, FFT/window 1024, hop 256, fmax 12000**, intended for compatible BigVGAN synthesis. The bundled HiFi-GAN previously fixed its input to 80 channels; it now reads `num_mels` from a supplied config, retaining 80 as its compatibility default. Inference rejects an acoustic/vocoder channel mismatch. BigVGAN code and weights are explicit external dependencies and are not vendored or downloaded automatically. The separately verified [official 24kHz/100-band BigVGAN](https://huggingface.co/nvidia/bigvgan_24khz_100band) matches this feature grid. The official StyleTTS LibriTTS 80-mel vocoder is not interchangeable with this 100-mel grid. Model, vocabulary, speaker count and complete feature grid must all match.
+
+## Independent source preparation
+
+Supply an audited JSONL manifest with `id`, `source_path`, `source_sha256`, `label` (a three-character string, preserving leading zeros), `utterance_id`, `text` and explicit `split` (`train`, `validation` or `test`). Alternatively specify an explicit validation utterance list; existing `test` rows are preserved and no original paper split is inferred. Source hash duplicates and ineligible/decode-failed rows are rejected. A shared RIFF/PCM frame preflight also rejects malformed final PCM frames before libsndfile can silently accept a complete prefix. The original restored dataset has 14 known decoding anomalies; retain its original bytes and audit their exclusion separately.
+
+```bash
+python prepare_gtr_dataset.py --manifest /data/eligible.jsonl --output /work/fp-derived \
+  --resample --with-pitch --speaker-id 199
+```
+
+The fresh output directory contains independent PCM16 waveforms, mel and unnormalized pitch tensors, filelists, a source/derivative hash manifest, and `preparation.json`. `--resample` explicitly permits derived resampling to 24 kHz without editing originals. Normalization follows the released peak-normalized 0.95 waveform mel path. Pitch now passes the actual sample rate, frame length and hop to `librosa.pyin`; the original code omitted the sample rate and silently estimated a 24 kHz waveform using 22.05 kHz defaults. This correction changes derived pitch values. **Do not reuse the old hardcoded pitch mean/std**: use `pitch_training_voiced_mean` and `pitch_training_voiced_std` from the receipt, computed on training sources only.
+
+## Training and checkpoint replay
+
+Install the tested environment from `../requirements.txt`, then run from this directory. The old list is preserved as `requirements-legacy.txt` for provenance and must not be mixed into the restored environment. `train.py` uses Adam without Apex; optional LAMB still requires NVIDIA Apex. CPU checks omit `--cuda`; distributed training uses scheduler-provided device/rank settings. Set caches/temp/output locations to the task volume on the Mac mini.
+
+```bash
+PYTHON=/path/to/python DEVICE=cuda INIT_CHECKPOINT=/models/aishell3-epoch80.pt \
+ DATASET_PATH=/work/fp-derived TRAIN_FILELIST=/work/fp-derived/filelists/train.txt \
+ VAL_FILELIST=/work/fp-derived/filelists/validation.txt OUTPUT_DIR=/work/fp-training \
+ PITCH_MEAN=VALUE_FROM_PREPARATION PITCH_STD=VALUE_FROM_PREPARATION bash finetune.sh
+```
+
+The wrapper defaults to the 3000-epoch/batch32/Adam contract with no hidden resume. Its warmup, loss settings, vocabulary and split remain explicit implementation choices where the paper is silent; inspect the persisted `train_setup` in every checkpoint. `train_aishell.sh` explicitly disables GTR embeddings during 80-epoch base pretraining. Base initialization allows only newly introduced G/T/R embedding keys to be absent; all unrelated missing or unexpected keys fail. A controlled inference checkpoint must include all GTR embeddings. Ordinary saved model/optimizer checkpoints use tensor-only loading; no silent unrestricted pickle fallback is used.
+
+For HiFi-GAN synthesis with a genuinely compatible checkpoint/config:
+
+```bash
+PYTHON=/path/to/python DEVICE=cpu FASTPITCH=/models/gtr.pt \
+ HIFIGAN=/models/vocoder.pt HIFIGAN_CONFIG=/models/vocoder.json \
+ FILELIST=/data/phrases.txt OUTPUT_DIR=/work/synthesis G=2 T=3 R=1 bash inference_gtr.sh
+```
+
+`inference_gtr_bigv.sh` requires explicit `BIGVGAN_ROOT`, `BIGVGAN_CHECKPOINT` and optionally `BIGVGAN_CONFIG` (default `$BIGVGAN_ROOT/config.json`). `DEVICE=cpu` and `DEVICE=cuda` are supported using ordinary PyTorch without compiling optional CUDA kernels. It runs `inference_bigv.py --save-mels` to export `(1, n_mels, frames)` arrays, then `vocode_bigvgan.py` for strict local-source/local-weight synthesis. It never deletes logs or fetches missing code.
+
+For a separately identified ground-truth vocoder diagnostic, without a FastPitch/GTR model:
+
+```bash
+python vocode_bigvgan.py --source-dir /models/bigvgan --config /models/bigvgan/config.json \
+  --checkpoint /models/bigvgan/bigvgan_generator.pt --audio /data/original.wav \
+  --source-sha256 ORIGINAL_SHA256 --resample --output /work/reconstruction.wav --device cpu
+```
+
+The waveform sidecar records the strict checkpoint/config/source-code hashes, input source or mel hash, actual output hash and sample count. `--max-seconds` explicitly makes a shortened derivative for a pilot; it is never a claim of full-source synthesis. A successful ground-truth vocoder reconstruction verifies the vocoder and feature grid; it does not verify a missing original FastPitch checkpoint or paper-quality GTR-conditioned TTS. Eager GTR inference is supported; controlled TorchScript export fails explicitly because the old JIT model omits the GTR controls. Native checkpoints remain the supported reproducible export format.
+
+## Engineering validation
+
+```bash
+python -m pytest -q tests
+```
+
+Focused tests run actual CPU forward/MAS, backward/Adam updates, control changes, save/strict replay, multiple mel cache configurations and source-preserving derived preparation with a known-frequency pitch check. The random fixtures are explicitly engineering checks. They do not reproduce the paper's 3000-epoch quality, MOS or human ratings. The original NVIDIA documentation is retained below as upstream background; it describes NVIDIA datasets and benchmark results, not a new GTR-Voice reproduction.
 
 # FastPitch 1.1 for PyTorch
 

@@ -13,7 +13,10 @@ export OMP_NUM_THREADS=1
 : ${AMP:=false}
 : ${SEED:=""}
 
-: ${LEARNING_RATE:=0.1}
+: ${LEARNING_RATE:=0.01}
+: ${OPTIMIZER:=adam}
+: ${CPU:=false}
+: ${TRAINLOADER_REPEATS:=1}
 
 # Adjust these when the amount of data changes
 : ${EPOCHS:=10000}
@@ -43,7 +46,7 @@ echo -e "\nAMP=$AMP, ${NUM_GPUS}x${BATCH_SIZE}x${GRAD_ACCUMULATION}" \
         "(global batch size ${GBS})\n"
 
 # ARGS=""
-ARGS+=" --cuda"
+[ "$CPU" = false ] && ARGS+=" --cuda"
 ARGS+=" -o $OUTPUT_DIR"
 ARGS+=" --log-file $LOG_FILE"
 ARGS+=" --dataset-path $DATASET_PATH"
@@ -51,7 +54,7 @@ ARGS+=" --training-files $TRAIN_FILELIST"
 ARGS+=" --validation-files $VAL_FILELIST"
 ARGS+=" -bs $BATCH_SIZE"
 ARGS+=" --grad-accumulation $GRAD_ACCUMULATION"
-ARGS+=" --optimizer lamb"
+ARGS+=" --optimizer $OPTIMIZER"
 ARGS+=" --epochs $EPOCHS"
 ARGS+=" --epochs-per-checkpoint $EPOCHS_PER_CHECKPOINT"
 
@@ -61,7 +64,7 @@ ARGS+=" --weight-decay 1e-6"
 ARGS+=" --grad-clip-thresh 1000.0"
 ARGS+=" --dur-predictor-loss-scale 0.1"
 ARGS+=" --pitch-predictor-loss-scale 0.1"
-ARGS+=" --trainloader-repeats 100"
+ARGS+=" --trainloader-repeats $TRAINLOADER_REPEATS"
 ARGS+=" --validation-freq 10"
 
 # Autoalign & new features
@@ -110,5 +113,8 @@ fi
 
 mkdir -p "$OUTPUT_DIR"
 
-: ${DISTRIBUTED:="-m torch.distributed.launch --nproc_per_node $NUM_GPUS"}
-python $DISTRIBUTED train.py $ARGS "$@"
+if [ "$NUM_GPUS" -gt 1 ]; then
+  "${PYTHON:-python}" -m torch.distributed.run --nproc_per_node "$NUM_GPUS" train.py $ARGS "$@"
+else
+  "${PYTHON:-python}" train.py $ARGS "$@"
+fi

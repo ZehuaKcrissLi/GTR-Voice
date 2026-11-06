@@ -39,6 +39,7 @@ from common.utils import mask_from_lens
 from fastpitch.alignment import b_mas, mas_width1
 from fastpitch.attention import ConvAttention
 from fastpitch.transformer import FFTransformer
+from fastpitch.gtr import validate_components
 
 
 def regulate_len(durations, enc_out, pace: float = 1.0,
@@ -241,7 +242,7 @@ class FastPitch(nn.Module):
                     log_attn_cpu[ind, 0, :out_lens_cpu[ind], :in_lens_cpu[ind]])
                 attn_out_cpu[ind, 0, :out_lens_cpu[ind], :in_lens_cpu[ind]] = hard_attn
             attn_out = torch.tensor(
-                attn_out_cpu, device=attn.get_device(), dtype=attn.dtype)
+                attn_out_cpu, device=attn.device, dtype=attn.dtype)
         return attn_out
 
     def binarize_attention_parallel(self, attn, in_lens, out_lens):
@@ -255,7 +256,7 @@ class FastPitch(nn.Module):
             log_attn_cpu = torch.log(attn.data).cpu().numpy()
             attn_out = b_mas(log_attn_cpu, in_lens.cpu().numpy(),
                              out_lens.cpu().numpy(), width=1)
-        return torch.from_numpy(attn_out).to(attn.get_device())
+        return torch.from_numpy(attn_out).to(attn.device)
 
     def forward(self, inputs, use_gt_pitch=True, pace=1.0, max_duration=75):
 
@@ -272,6 +273,11 @@ class FastPitch(nn.Module):
             spk_emb = self.speaker_emb(speaker).unsqueeze(1)
             spk_emb.mul_(self.speaker_emb_weight)
 
+        # Validate the coupled whisper support before embedding lookup.
+        if self.g_emb is not None:
+            if g is None or t is None or r is None:
+                raise ValueError("GTR-conditioned training needs G/T/R labels")
+            validate_components(g, t, r)
         # add GTR embedding to the encoder output
         if self.g_emb is None:
             g_embedding = 0
@@ -364,7 +370,8 @@ class FastPitch(nn.Module):
               energy_tgt=None, pitch_transform=None, max_duration=75,
               speaker=0, g=2, t=3, r=1):
 
-        print('speaker, gtr',speaker, g,t,r)
+        if self.g_emb is not None:
+            validate_components(g, t, r)
         if self.speaker_emb is None:
             spk_emb = 0
         else:

@@ -139,7 +139,7 @@ def get_padding(kernel_size, dilation=1):
 
 def load_pretrained_weights(model, ckpt_fpath):
     model = getattr(model, "module", model)
-    weights = torch.load(ckpt_fpath, map_location="cpu")["state_dict"]
+    weights = torch.load(ckpt_fpath, map_location="cpu", weights_only=True)["state_dict"]
     weights = {re.sub("^module.", "", k): v for k, v in weights.items()}
 
     ckpt_emb = weights["encoder.word_emb.weight"]
@@ -152,10 +152,15 @@ def load_pretrained_weights(model, ckpt_fpath):
               "of embedding table. For best results, extend the vocab "
               "and ensure the common symbols' indices match.")
         min_len = min(ckpt_vocab_size, new_vocab_size)
-        weights["encoder.word_emb.weight"] = ckpt_emb if ckpt_vocab_size > new_vocab_size else new_emb
+        weights["encoder.word_emb.weight"] = new_emb.clone()
         weights["encoder.word_emb.weight"][:min_len] = ckpt_emb[:min_len]
 
-    model.load_state_dict(weights)
+    status = model.load_state_dict(weights, strict=False)
+    allowed_new = {"g_emb.weight", "t_emb.weight", "r_emb.weight"}
+    if set(status.missing_keys) - allowed_new or status.unexpected_keys:
+        raise RuntimeError(f"Incompatible pretrained state: {status}")
+    if status.missing_keys:
+        print("New GTR conditioning layers initialized for finetuning:", status.missing_keys)
 
 
 class AttrDict(dict):
@@ -216,7 +221,7 @@ class Checkpointer:
 
         def corrupted(fpath):
             try:
-                torch.load(fpath, map_location="cpu")
+                torch.load(fpath, map_location="cpu", weights_only=True)
                 return False
             except:
                 warnings.warn(f"Cannot load {fpath}")
@@ -250,7 +255,7 @@ class Checkpointer:
             return
 
         print_once(f"Loading model and optimizer state from {fpath}")
-        ckpt = torch.load(fpath, map_location="cpu")
+        ckpt = torch.load(fpath, map_location="cpu", weights_only=True)
         train_state["epoch"] = ckpt["epoch"] + 1
         train_state["total_iter"] = ckpt["iteration"]
 
@@ -300,7 +305,9 @@ class Checkpointer:
 
         fpath = Path(args.output, f"FastPitch_checkpoint_{epoch}.pt")
         print(f"Saving model and optimizer state at epoch {epoch} to {fpath}")
-        torch.save(ckpt, fpath)
+        temporary = fpath.with_name(fpath.name + ".tmp")
+        torch.save(ckpt, temporary)
+        os.replace(temporary, fpath)
 
         # Remove old checkpoints; keep milestones and the last two
         self.tracked[epoch] = fpath

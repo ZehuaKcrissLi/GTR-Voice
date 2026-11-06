@@ -1,8 +1,6 @@
 """ from https://github.com/keithito/tacotron """
 
 import re
-import sys
-import urllib.request
 from pathlib import Path
 
 
@@ -28,10 +26,9 @@ class CMUDict:
       self.initialize(file_or_path, heteronyms_path, keep_ambiguous)
 
   def initialize(self, file_or_path, heteronyms_path, keep_ambiguous=True):
-    if isinstance(file_or_path, str):
-      if not Path(file_or_path).exists():
-        print("CMUdict missing. Downloading to data/cmudict/.")
-        self.download()
+    if isinstance(file_or_path, (str, Path)):
+      if not Path(file_or_path).is_file():
+        raise FileNotFoundError(f"CMUdict is missing: {file_or_path}. Supply an existing --cmudict-path, explicitly download assets separately, or use --p-arpabet 0. No download was attempted.")
 
       with open(file_or_path, encoding='latin-1') as f:
         entries = _parse_cmudict(f)
@@ -59,17 +56,7 @@ class CMUDict:
     return self._entries.get(word.upper())
 
   def download(self):
-    url = 'https://github.com/Alexir/CMUdict/raw/master/cmudict-0.7b'
-    try:
-      Path('cmudict').mkdir(parents=False, exist_ok=True)
-      urllib.request.urlretrieve(url, filename='cmudict/cmudict-0.7b')
-    except:
-      print("Automatic download of CMUdict failed. Try manually with:")
-      print()
-      print("    bash scripts/download_cmudict.sh")
-      print()
-      print("and re-run the script.")
-      sys.exit(0)
+    raise RuntimeError("Implicit CMUdict downloads are disabled. Use the explicit scripts/download_cmudict.sh asset preparation command separately.")
 
 
 _alt_re = re.compile(r'\([0-9]+\)')
