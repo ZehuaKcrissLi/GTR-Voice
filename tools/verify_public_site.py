@@ -39,7 +39,10 @@ def error_text(error):
 
 
 def emit(event, **fields):
-    print(json.dumps({"event": event, **fields}, ensure_ascii=False), flush=True)
+    # Keep detailed receipts below per-line log limits. The event remains a
+    # complete JSON object, formatted across lines for check/final receipts.
+    indent = 2 if event in {"check_result", "final_result"} else None
+    print(json.dumps({"event": event, **fields}, ensure_ascii=False, indent=indent), flush=True)
 
 
 def require(condition, message):
@@ -80,9 +83,33 @@ class BrowserMediaCapture:
     """Observe real media responses from BEFORE navigation, including preload."""
     def __init__(self, page):
         self.page, self.parts, self.errors, self.tasks = page, {}, {}, set()
-        self.pending, self.fatal = {}, {}
+        self.pending, self.fatal, self.completions = {}, {}, {}
         self.closed = False
         page.on("response", self.observed)
+        page.on("requestfinished", self.finished)
+        page.on("requestfailed", self.failed)
+
+    def completion(self, request):
+        if request not in self.completions:
+            self.completions[request] = asyncio.get_running_loop().create_future()
+        return self.completions[request]
+
+    def finish_request(self, request, error=None):
+        parsed = urlsplit(request.url)
+        if (self.closed or parsed.scheme + "://" + parsed.netloc != ORIGIN or
+                not parsed.path.lower().endswith(".wav") or request.resource_type != "media"):
+            return
+        future = self.completion(request)
+        if not future.done():
+            # A result, rather than an exception, cannot become an un-retrieved
+            # task exception when a metadata request is aborted or page closes.
+            future.set_result(error)
+
+    def finished(self, request):
+        self.finish_request(request)
+
+    def failed(self, request):
+        self.finish_request(request, request.failure or "Browser requestfailed")
 
     def observed(self, response):
         parsed = urlsplit(response.url)
@@ -99,10 +126,13 @@ class BrowserMediaCapture:
         url = response.url
         try:
             require(response.status in (200, 206), f"PUBLIC_AUDIO_MEDIA_HTTP_{response.status}")
-            completion = await asyncio.wait_for(response.finished(), timeout=25)
+            # Public requestfinished/requestfailed events provide the completion
+            # witness. Do not cancel Response.finished(): Playwright creates an
+            # inner task there which can report un-retrieved Target closed errors.
+            completion = await asyncio.wait_for(asyncio.shield(self.completion(response.request)), timeout=25)
             if completion is not None:
                 raise RuntimeError("Browser media response did not finish successfully: " + str(completion))
-            raw = await response.body()
+            raw = await asyncio.wait_for(response.body(), timeout=15)
             declared = response.headers.get("content-length")
             require(not declared or int(declared) == len(raw), "Captured media body length differs from header")
             if response.status == 206:
@@ -154,7 +184,14 @@ class BrowserMediaCapture:
     async def close(self):
         self.closed = True
         self.page.remove_listener("response", self.observed)
+        self.page.remove_listener("requestfinished", self.finished)
+        self.page.remove_listener("requestfailed", self.failed)
+        for future in self.completions.values():
+            if not future.done():
+                future.set_result("Media capture closed")
         pending = list(self.tasks)
+        if pending:
+            _, pending = await asyncio.wait(pending, timeout=2)
         for task in pending:
             task.cancel()
         if pending:
@@ -315,6 +352,19 @@ async def comparisons(context, network):
 
 async def graph(context):
     page = await context.new_page()
+    diagnostics, page_errors, player = [], [], None
+    clicked, attempts, points = False, 0, None
+    page.on("pageerror", lambda error: page_errors.append(error_text(error)) if len(page_errors) < 20 else None)
+    async def snapshot():
+        return await page.evaluate("""() => {
+          const a=document.querySelector('#gtr-graph-audio');
+          return {hover:window.__publicVerifierHover || null,
+            observed_click:window.__publicVerifierClick || null,
+            player:a ? {src:a.src,currentSrc:a.currentSrc,paused:a.paused,
+              currentTime:a.currentTime,duration:Number.isFinite(a.duration)?a.duration:null,
+              readyState:a.readyState,networkState:a.networkState,
+              error:a.error ? {code:a.error.code,message:a.error.message}:null}:null};
+        }""")
     try:
         await navigate(page, "/GTR-3D-plot")
         await page.wait_for_function("""() => {
@@ -334,7 +384,7 @@ async def graph(context):
             src:new URL(e.points[0].customdata[0],location.href).href}; });
         }""")
         box = await page.locator(".plotly-graph-div").bounding_box()
-        clicked, attempts = False, 0
+        attempted_sources = set()
         # Listen to real Plotly hover events while moving the real pointer.
         # Do not emit a plotly_click or assign the player's source to fake a hit.
         for y in range(70, min(int(box["height"]) - 30, 470), 22):
@@ -342,10 +392,20 @@ async def graph(context):
                 await page.mouse.move(box["x"] + x, box["y"] + y)
                 await page.wait_for_timeout(25)
                 hovered = await page.evaluate("window.__publicVerifierHover")
-                if hovered and not hovered.endswith("/010/18.wav"):
+                if hovered and not hovered.endswith("/010/18.wav") and hovered not in attempted_sources:
+                    # Allow the genuine 3D hit-test to settle, then send an
+                    # actual down/up pair. Never immediately toggle the same
+                    # playing point by repeatedly clicking its source.
+                    await page.wait_for_timeout(100)
+                    settled = await page.evaluate("window.__publicVerifierHover")
+                    if settled != hovered:
+                        continue
+                    attempted_sources.add(hovered)
                     before_click = await page.evaluate("window.__publicVerifierClick.sequence")
-                    await page.mouse.click(box["x"] + x, box["y"] + y)
+                    before_state = await snapshot()
+                    await page.mouse.click(box["x"] + x, box["y"] + y, delay=80)
                     attempts += 1
+                    click_error = None
                     try:
                         await page.wait_for_function("""previous => {
                           const click=window.__publicVerifierClick;
@@ -353,22 +413,37 @@ async def graph(context):
                           return click.sequence>previous && click.src &&
                             !click.src.endsWith('/010/18.wav') && audio.src===click.src &&
                             audio.currentSrc===click.src && !audio.paused && audio.currentTime>0.1;
-                        }""", arg=before_click, timeout=1500)
+                        }""", arg=before_click, timeout=3000)
                         clicked = True
+                    except Exception as error:
+                        click_error = error_text(error)
+                    diagnostics.append({"attempt":attempts,"hover_url":hovered,
+                                        "position":{"x":x,"y":y},"before":before_state,
+                                        "after":await snapshot(),"wait_error":click_error})
+                    if clicked:
                         break
-                    except Exception:
-                        pass  # bounded next real point, never synthetic click/source assignment
                 if attempts >= 8:
                     break
             if clicked or attempts >= 8:
                 break
-        require(clicked, "GRAPH_RENDER_OR_HIT_TEST_UNAVAILABLE: no real point hover/click; no bypass attempted")
-        result = await media_probe(page, page.locator("#gtr-graph-audio"), already_playing=True, test_drag=True)
-        return {"passed": result["physical_drag_verified"], "scatter3d_points": points,
+        require(clicked, "GRAPH_REAL_CLICK_PLAYBACK_NOT_VERIFIED: inspect actual event/player diagnostics; no bypass attempted")
+        player = await media_probe(page, page.locator("#gtr-graph-audio"), already_playing=True, test_drag=True)
+        return {"passed": player["physical_drag_verified"], "scatter3d_points": points,
                 "point_click": "real_pointer_with_observed_plotly_click_and_matching_playing_src",
                 "physical_click_attempts": attempts,
                 "observed_click": await page.evaluate("window.__publicVerifierClick"),
-                "player": result, "physical_drag_verified": result["physical_drag_verified"]}
+                "attempt_diagnostics":diagnostics,"page_errors":page_errors,
+                "player": player, "physical_drag_verified": player["physical_drag_verified"]}
+    except Exception as error:
+        try:
+            last_state = await snapshot()
+        except Exception as state_error:
+            last_state = {"snapshot_error":error_text(state_error)}
+        return {"passed":False,"error":error_text(error),"scatter3d_points":points,
+                "physical_click_attempts":attempts,"real_click_and_matching_playback_verified":clicked,
+                "attempt_diagnostics":diagnostics,"last_state":last_state,
+                "page_errors":page_errors,"player":player,
+                "physical_drag_verified":bool(player and player.get("physical_drag_verified"))}
     finally:
         await page.close()
 
@@ -516,6 +591,7 @@ async def verify(scratch, report, *, media_only=False):
                     result = {"passed": False, "error": error_text(error) or type(error).__name__}
                 report["checks"][name] = result
                 emit("check_finished", check=name, passed=result["passed"])
+                emit("check_result", check=name, result=result)
             report["network"] = {"observed_same_origin_audio_http_206": sum(item["status"] == 206 for item in network),
                                  "audio_206_examples": [item for item in network if item["status"] == 206][:5],
                                  "legacy_ngrok_requests": legacy}
@@ -525,6 +601,37 @@ async def verify(scratch, report, *, media_only=False):
         finally:
             await browser.close()
             report["browser"]["closed"] = True
+
+
+def finalize_report(report, *, media_only):
+    """Pure, None-safe terminal accounting, also used by synthetic fixtures."""
+    def check(name):
+        value = report["checks"].get(name)
+        return value if isinstance(value, dict) else {}
+    def player(name):
+        value = check(name).get("player")
+        return value if isinstance(value, dict) else {}
+    expected = {"homepage_and_guide", "comparison_audio", "graph_click_and_timeline",
+                "fastpitch_evaluation", "styletts_evaluation"}
+    if not media_only:
+        expected.add("complete_dataset_download")
+    for name in sorted(expected):
+        if not check(name).get("passed"):
+            report["failures"].append(name)
+    first = next((item for item in (check("comparison_audio").get("verified_play_and_seek") or [])
+                  if isinstance(item, dict) and item.get("player_index") == 0), {})
+    report["drag_checks"] = {
+        "homepage_first_player": first.get("physical_drag_verified", False),
+        "graph_player": player("graph_click_and_timeline").get("physical_drag_verified", False),
+        "fastpitch_evaluation": player("fastpitch_evaluation").get("physical_drag_verified", False),
+        "styletts_evaluation": player("styletts_evaluation").get("physical_drag_verified", False),
+    }
+    report["physical_drag_verified"] = all(report["drag_checks"].values())
+    report["complete_dataset_download_verified_this_run"] = bool(
+        not media_only and check("complete_dataset_download").get("passed"))
+    success = not report["failures"] and report.get("cleanup", {}).get("temporary_downloads_deleted")
+    report["status"] = ("PASS_MEDIA_ONLY" if media_only else "PASS") if success else "FAILED_OR_PARTIAL"
+    report["finished_utc"] = datetime.now(timezone.utc).isoformat()
 
 
 def main():
@@ -578,33 +685,24 @@ def main():
                 report["cleanup"] = {"temporary_downloads_deleted": False, "error": error_text(error)}
                 report["failures"].append("Temporary download cleanup failed")
             emit("cleanup", **report["cleanup"])
-    expected = {"homepage_and_guide", "comparison_audio", "graph_click_and_timeline",
-                "fastpitch_evaluation", "styletts_evaluation"}
-    if not args.media_only:
-        expected.add("complete_dataset_download")
-    for name in sorted(expected):
-        if not report["checks"].get(name, {}).get("passed"):
-            report["failures"].append(name)
-    first = next((item for item in report["checks"].get("comparison_audio", {}).get("verified_play_and_seek", [])
-                  if item.get("player_index") == 0), {})
-    report["drag_checks"] = {
-        "homepage_first_player": first.get("physical_drag_verified", False),
-        "graph_player": report["checks"].get("graph_click_and_timeline", {}).get("player", {}).get("physical_drag_verified", False),
-        "fastpitch_evaluation": (report["checks"].get("fastpitch_evaluation", {}).get("player") or {}).get("physical_drag_verified", False),
-        "styletts_evaluation": (report["checks"].get("styletts_evaluation", {}).get("player") or {}).get("physical_drag_verified", False),
-    }
-    report["physical_drag_verified"] = all(report["drag_checks"].values())
-    report["complete_dataset_download_verified_this_run"] = bool(
-        not args.media_only and report["checks"].get("complete_dataset_download", {}).get("passed"))
-    success = not report["failures"] and report.get("cleanup", {}).get("temporary_downloads_deleted")
-    report["status"] = ("PASS_MEDIA_ONLY" if args.media_only else "PASS") if success else "FAILED_OR_PARTIAL"
-    report["finished_utc"] = datetime.now(timezone.utc).isoformat()
-    emit("final_result", result=report)
+    try:
+        finalize_report(report, media_only=args.media_only)
+    except Exception as error:
+        report["failures"].append("Terminal accounting error: " + error_text(error))
+        report["status"] = "FAILED_OR_PARTIAL"
+        report["finished_utc"] = datetime.now(timezone.utc).isoformat()
     summary = os.environ.get("GITHUB_STEP_SUMMARY")
     if summary:
-        with open(summary, "a", encoding="utf-8") as stream:
-            stream.write("## GTR public browser verification: " + report["status"] + "\n\n```json\n")
-            stream.write(json.dumps(report, ensure_ascii=False, indent=2) + "\n```\n")
+        try:
+            with open(summary, "a", encoding="utf-8") as stream:
+                stream.write("## GTR public browser verification: " + report["status"] + "\n\n```json\n")
+                stream.write(json.dumps(report, ensure_ascii=False, indent=2) + "\n```\n")
+        except Exception as error:
+            report["failures"].append("Step summary write failed: " + error_text(error))
+            report["status"] = "FAILED_OR_PARTIAL"
+    # Always print the terminal JSON, including failures, after cleanup and
+    # accounting. Pretty lines avoid losing a >64 KiB single log record.
+    emit("final_result", result=report)
     return 0 if report["status"] in {"PASS", "PASS_MEDIA_ONLY"} else 1
 
 
