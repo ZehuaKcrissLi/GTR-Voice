@@ -448,7 +448,122 @@ async def graph(context):
         await page.close()
 
 
-async def evaluation(context, path):
+async def decode_captured_wav(page, raw):
+    """Decode only complete captured browser bytes with the page Chromium."""
+    require(raw[:4] == b"RIFF" and raw[8:12] == b"WAVE",
+            "PUBLIC_AUDIO_NOT_WAV_OR_CHALLENGE; no bypass attempted")
+    decoded_audio = await page.evaluate("""async encoded => {
+      const bytes=Uint8Array.from(atob(encoded),c=>c.charCodeAt(0));
+      const ctx=new AudioContext();
+      try {
+        const audio=await ctx.decodeAudioData(bytes.buffer);
+        if(!audio.length || !Number.isFinite(audio.duration) || audio.duration<=0) throw Error('Empty/nonfinite decode');
+        for(let c=0;c<audio.numberOfChannels;c++) {
+          const channel=audio.getChannelData(c);
+          for(let i=0;i<channel.length;i++) if(!Number.isFinite(channel[i])) throw Error('Nonfinite PCM');
+        }
+        return {frames:audio.length,decoded_sample_rate:audio.sampleRate};
+      } finally { await ctx.close(); }
+    }""", base64.b64encode(raw).decode("ascii"))
+    return decoded_audio
+
+
+def isolated_capture_eligible(record):
+    """Only the observed nonfatal, aborted-preload missing-prefix condition."""
+    primary = record.get("primary_capture") or {}
+    coverage = primary.get("coverage") or {}
+    ranges = coverage.get("captured_ranges") or []
+    total, covered = coverage.get("total_bytes"), coverage.get("covered_bytes")
+    return bool(not record.get("passed") and
+                record.get("failure_kind") == "incomplete_browser_coverage" and
+                not primary.get("fatal_errors") and
+                any("net::ERR_ABORTED" in error for error in primary.get("errors", [])) and
+                isinstance(total, int) and isinstance(covered, int) and 0 < covered < total and
+                ranges and all(item["start"] > 0 for item in ranges) and
+                max(item["end"] for item in ranges) == total - 1 and
+                covered == total - min(item["start"] for item in ranges))
+
+
+def select_isolated_paths(records, sources, attempted):
+    """Consume the shared run budget before starting each one-time attempt."""
+    selected = []
+    for index, item in enumerate(records):
+        if not isolated_capture_eligible(item):
+            continue
+        if sources[index] not in attempted and len(attempted) < 3:
+            selected.append(index)
+            attempted.add(sources[index])
+        else:
+            item["isolated_capture"] = {"attempted":False,"reason":"three-path/once-per-path run bound"}
+    return selected
+
+
+async def isolated_native_capture(browser, url, prior_parts):
+    """One ordinary native-player load in a new cache-isolated context."""
+    require(public_url(url).startswith(ORIGIN + "/"), "Isolated media left public origin")
+    isolated = await browser.new_context(accept_downloads=False, viewport={"width": 1000, "height": 800})
+    page, capture, result = None, None, None
+    try:
+        page = await isolated.new_page()
+        capture = BrowserMediaCapture(page)
+        await navigate(page, "/evaluation_demo")
+        require(await page.locator("audio").count() == 0, "Isolation landing unexpectedly contains audio")
+        await page.evaluate("""url => {
+          const audio=document.createElement('audio');
+          audio.id='public-verifier-isolated-audio';audio.controls=true;
+          audio.preload='auto';audio.style.width='500px';audio.src=url;
+          document.body.prepend(audio);
+        }""", url)
+        audio = page.locator("#public-verifier-isolated-audio")
+        require(await audio.evaluate("a=>a.src") == url, "Isolated player source changed")
+        await audio.scroll_into_view_if_needed()
+        box = await audio.bounding_box()
+        require(box and box["width"] >= 180, "Isolated native controls unavailable")
+        await audio.click(position={"x":18,"y":box["height"] / 2}, delay=80)
+        await page.wait_for_function(
+            "a=>!a.paused && Number.isFinite(a.duration) && a.currentTime>0.2",
+            arg=await audio.element_handle(), timeout=15_000)
+        before = await audio.evaluate("a=>a.currentTime")
+        await page.wait_for_timeout(350)
+        after = await audio.evaluate("a=>a.currentTime")
+        require(after > before + .08, "Isolated native player clock did not advance")
+        raw, coverage = await capture.complete(url, seconds=25)
+        # Same URL alone is insufficient: retain version consistency with every
+        # previously observed byte, using only actual old/fresh media responses.
+        require(prior_parts, "No original browser ranges retained for version comparison")
+        combined, comparison = assemble_media_ranges([*prior_parts, *capture.parts.get(url, [])])
+        require(combined == raw, "Isolated complete body differs from original observed ranges")
+        decoded = await decode_captured_wav(page, raw)
+        await audio.evaluate("a=>a.pause()")
+        result = {"passed":True,"bytes":len(raw),"browser_range_coverage":coverage,
+                  "other_capture_errors":capture.errors.get(url, []),
+                  "complete_body_verified":True,"native_playback_clock_advanced":True,
+                  "matches_original_observed_ranges":True,"original_and_fresh_range_comparison":comparison,
+                  "native_clock_before":before,"native_clock_after":after,**decoded}
+    except Exception as error:
+        try:
+            _, coverage = capture.available(url)
+        except Exception as coverage_error:
+            coverage = {"inspection_error":error_text(coverage_error)}
+        result = {"passed":False,"error":error_text(error) or type(error).__name__,
+                  "browser_range_coverage":coverage,
+                  "other_capture_errors":list(capture.errors.get(url, [])) if capture else [],
+                  "fatal_capture_errors":list(capture.fatal.get(url, [])) if capture else []}
+    finally:
+        try:
+            if capture is not None:
+                await capture.close()
+        finally:
+            await isolated.close()
+    return {**result,"fresh_context_closed":True,
+            "resource_transport":"isolated fresh-context native controls/preload-auto real click on unchanged URL",
+            "landing_path":"/evaluation_demo","original_evaluation_dom_player":False,
+            "api_fetch_or_cache_busting":False,"page_csp_unchanged":True}
+
+
+async def evaluation(context, path, *, isolated_attempted=None):
+    if isolated_attempted is None:
+        isolated_attempted = set()
     page = await context.new_page()
     capture = BrowserMediaCapture(page)  # installed before navigation/autopreload
     try:
@@ -469,28 +584,43 @@ async def evaluation(context, path):
                     if raw is None:
                         await audio.evaluate("a => { a.preload='auto'; a.load(); }")
                         raw, coverage = await capture.complete(url)
-                    require(raw[:4] == b"RIFF" and raw[8:12] == b"WAVE",
-                            "PUBLIC_AUDIO_NOT_WAV_OR_CHALLENGE; no bypass attempted")
-                    decoded_audio = await page.evaluate("""async encoded => {
-                      const bytes=Uint8Array.from(atob(encoded),c=>c.charCodeAt(0));
-                      const ctx=new AudioContext();
-                      try {
-                        const audio=await ctx.decodeAudioData(bytes.buffer);
-                        if(!audio.length || !Number.isFinite(audio.duration) || audio.duration<=0) throw Error('Empty/nonfinite decode');
-                        for(let c=0;c<audio.numberOfChannels;c++) {
-                          const channel=audio.getChannelData(c);
-                          for(let i=0;i<channel.length;i++) if(!Number.isFinite(channel[i])) throw Error('Nonfinite PCM');
-                        }
-                        return {frames:audio.length,decoded_sample_rate:audio.sampleRate};
-                      } finally { await ctx.close(); }
-                    }""", base64.b64encode(raw).decode("ascii"))
+                    decoded_audio = await decode_captured_wav(page, raw)
                     return {"path": urlsplit(url).path, "passed": True,
                             "bytes": len(raw), "browser_range_coverage": coverage,
                             "other_capture_errors": capture.errors.get(url, []),
                             "complete_body_verified": True, **decoded_audio}
                 except Exception as error:
-                    return {"path": urlsplit(url).path, "passed": False, "error": error_text(error)}
+                    try:
+                        _, coverage = capture.available(url)
+                    except Exception as coverage_error:
+                        coverage = {"inspection_error":error_text(coverage_error)}
+                    message = error_text(error)
+                    return {"path":urlsplit(url).path,"passed":False,"error":message,
+                            "failure_kind":"incomplete_browser_coverage" if message.startswith(
+                                "Incomplete observed browser media coverage:") else "other",
+                            "primary_capture":{"coverage":coverage,
+                                               "errors":list(capture.errors.get(url, [])),
+                                               "fatal_errors":list(capture.fatal.get(url, []))}}
         decoded = await asyncio.gather(*(decode_public_resource(index, url) for index, url in enumerate(sources)))
+        original_page_decoded = sum(item["passed"] for item in decoded)
+        # Only incomplete prefix captures after an aborted metadata preload are
+        # eligible. Three paths per run maximum, once each; never retry a failed HTTP,
+        # inconsistent range, challenge or decoder result with another identity.
+        selected = select_isolated_paths(decoded, sources, isolated_attempted)
+        async def finish_isolated(index):
+            original = decoded[index]
+            attempt = {"attempted":True,"attempts":1,"fresh_context_per_path":True,
+                       "landing_path":"/evaluation_demo","source_url":sources[index],
+                       "method":"native controls with real mouse play","deadline_seconds":40}
+            try:
+                result = await asyncio.wait_for(isolated_native_capture(
+                    context.browser, sources[index], list(capture.parts.get(sources[index], []))), timeout=40)
+                decoded[index] = {"path":original["path"],**result,"initial_attempt":original,
+                                  "isolated_capture":attempt}
+            except Exception as error:
+                original["isolated_capture"] = {**attempt,"passed":False,
+                                                "error":error_text(error) or type(error).__name__}
+        await asyncio.gather(*(finish_isolated(index) for index in selected))
         player, player_error = None, None
         try:
             player = await media_probe(page, page.locator("table audio").first, test_drag=True)
@@ -499,6 +629,10 @@ async def evaluation(context, path):
         failures = [item for item in decoded if not item["passed"]]
         return {"passed": not failures and player_error is None and bool(player and player["physical_drag_verified"]), "page": path,
                 "stimuli": len(sources), "browser_decoded": sum(item["passed"] for item in decoded),
+                "original_evaluation_page_decoded":original_page_decoded,
+                "isolated_native_player_decoded":sum(bool(item.get("isolated_capture", {}).get("attempted") and item["passed"]) for item in decoded),
+                "isolated_capture_max_paths_per_run":3,"isolated_capture_attempts":len(selected),
+                "isolated_capture_attempted_paths_run_to_date":len(isolated_attempted),
                 "resource_transport": "actual browser preload/load response ranges, contiguous complete bytes; not fetch/API client",
                 "decoder": "Chromium AudioContext.decodeAudioData", "page_csp_unchanged": True,
                 "decoded": decoded, "player": player, "player_error": player_error}
@@ -548,6 +682,7 @@ async def dataset_download(context, scratch):
 async def verify(scratch, report, *, media_only=False):
     from playwright.async_api import async_playwright
     network, legacy = [], []
+    isolated_attempted = set()
     async with async_playwright() as playwright:
         browser = await playwright.chromium.launch(
             channel="chrome", headless=True, chromium_sandbox=True,
@@ -574,8 +709,8 @@ async def verify(scratch, report, *, media_only=False):
             checks = [("homepage_and_guide", 90, lambda: homepage(context)),
                       ("comparison_audio", 180, lambda: comparisons(context, network)),
                       ("graph_click_and_timeline", 60, lambda: graph(context)),
-                      ("fastpitch_evaluation", 120, lambda: evaluation(context, "/fspt/evaluation_1.html")),
-                      ("styletts_evaluation", 120, lambda: evaluation(context, "/stts/evaluation_22.html"))]
+                      ("fastpitch_evaluation", 120, lambda: evaluation(context, "/fspt/evaluation_1.html", isolated_attempted=isolated_attempted)),
+                      ("styletts_evaluation", 120, lambda: evaluation(context, "/stts/evaluation_22.html", isolated_attempted=isolated_attempted))]
             if media_only:
                 report["checks"]["complete_dataset_download"] = {
                     "status": "SKIPPED_MEDIA_ONLY", "passed": None, "download_attempts": 0,
