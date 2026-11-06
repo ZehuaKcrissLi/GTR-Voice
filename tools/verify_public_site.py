@@ -1,0 +1,473 @@
+#!/usr/bin/env python3
+"""One-shot public-browser acceptance on a disposable GitHub-hosted Linux job.
+
+No saved profile, credentials, UA override, security flags, challenge bypass,
+artifact upload or download retry. The original ZIP is downloaded only here.
+"""
+from __future__ import annotations
+
+import asyncio
+import base64
+from datetime import datetime, timezone
+import hashlib
+import json
+import os
+from pathlib import Path
+import platform
+import re
+import shutil
+import subprocess
+import tempfile
+from urllib.parse import urlsplit
+import zipfile
+
+ORIGIN = "https://demo.gtr-voice.com"
+GUIDE = "https://github.com/ZehuaKcrissLi/GTR-Voice/blob/main/docs/reproduction.md"
+ZIP_BYTES = 1_044_673_451
+ZIP_SHA256 = "d2b1301acbdeac7ca8e3808eae0d0f6396b9bb6c5afe4c84585c22a307c826e0"
+
+
+def public_url(value):
+    parsed = urlsplit(value)
+    return parsed.scheme + "://" + parsed.netloc + parsed.path
+
+
+def error_text(error):
+    # GitHub asset redirects may contain temporary signed query strings.
+    return re.sub(r"https?://[^\s<>\"']+", lambda m: public_url(m.group()), str(error))[:1800]
+
+
+def emit(event, **fields):
+    print(json.dumps({"event": event, **fields}, ensure_ascii=False), flush=True)
+
+
+def require(condition, message):
+    if not condition:
+        raise AssertionError(message)
+
+
+async def challenge_check(page):
+    title = await page.title()
+    blocked = await page.locator(
+        "#challenge-form, #challenge-running, iframe[src*='challenges.cloudflare.com']"
+    ).count()
+    text = (await page.locator("body").inner_text())[:6000]
+    require(not blocked and not re.search(
+        r"just a moment|verify you are human|checking your browser|attention required.*cloudflare",
+        title + "\n" + text, re.I), "PUBLIC_BROWSER_CHALLENGE: no bypass attempted")
+
+
+async def navigate(page, path):
+    response = await page.goto(ORIGIN + path, wait_until="domcontentloaded", timeout=35_000)
+    await challenge_check(page)
+    require(response is not None and response.status == 200,
+            f"Public document HTTP {response.status if response is not None else chr(63)}; expected 200")
+    require(urlsplit(page.url).netloc == urlsplit(ORIGIN).netloc,
+            "Unexpected origin document redirect")
+
+
+async def media_probe(page, audio, *, already_playing=False, test_drag=False):
+    """Actual native-control clicks; no play()/currentTime assignment shortcut."""
+    await audio.scroll_into_view_if_needed()
+    source = await audio.evaluate("a => a.currentSrc || a.src")
+    require(public_url(source).startswith(ORIGIN + "/"), "Audio left the public origin")
+    if not already_playing:
+        box = await audio.bounding_box()
+        require(box and box["width"] >= 180, "Native audio controls are too narrow")
+        await audio.click(position={"x": 18, "y": box["height"] / 2})
+    handle = await audio.element_handle()
+    await page.wait_for_function(
+        "a => !a.paused && Number.isFinite(a.duration) && a.currentTime > 0.2",
+        arg=handle, timeout=15_000)
+    first = await audio.evaluate("a => ({time:a.currentTime,duration:a.duration})")
+    await page.wait_for_timeout(350)
+    second = await audio.evaluate("a => a.currentTime")
+    require(second > first["time"] + .08, "Media clock did not advance during playback")
+    await audio.evaluate("a => a.pause()")
+    before = await audio.evaluate("a => a.currentTime")
+    await audio.evaluate("""a => {
+      a.__publicVerifierSeeks=0;
+      a.addEventListener('seeked',()=>{a.__publicVerifierSeeks++;});
+    }""")
+    box = await audio.bounding_box()
+    sought, seek_fraction = None, None
+    # Chromium's native timeline is centered; these are real pointer clicks.
+    # Try other positions only if a click did not seek, never a JS assignment.
+    for fraction in (.55, .65, .45):
+        await audio.click(position={"x": box["width"] * fraction,
+                                    "y": box["height"] / 2})
+        await page.wait_for_timeout(250)
+        after = await audio.evaluate("a => ({time:a.currentTime,seeks:a.__publicVerifierSeeks})")
+        if after["seeks"] > 0 and abs(after["time"] - before) > min(.5, first["duration"] * .12):
+            sought = after["time"]
+            seek_fraction = fraction
+            break
+    await audio.evaluate("a => a.pause()")
+    require(sought is not None, "Native timeline click did not produce an observable seek")
+    result = {"path": urlsplit(source).path, "duration": first["duration"],
+            "playback_clock_advanced": True, "seek_before": before, "seek_after": sought,
+            "seek_method": "native_control_pointer_click", "physical_drag_requested": test_drag,
+            "physical_drag_verified": False}
+    if test_drag:
+        try:
+            # The successful timeline click identifies a real native slider
+            # position. Start there, then send a genuine down/move/up sequence.
+            box = await audio.bounding_box()
+            start_x = box["x"] + box["width"] * seek_fraction
+            y = box["y"] + box["height"] / 2
+            delta = min(32, box["width"] * .08)
+            await page.mouse.move(start_x, y)
+            await page.mouse.down()
+            try:
+                # A track press can itself seek. Exclude that change from the
+                # drag proof: only measure movement/release after mouse-down.
+                await page.wait_for_timeout(120)
+                state = await audio.evaluate("a => ({time:a.currentTime,seeks:a.__publicVerifierSeeks})")
+                await page.mouse.move(start_x + delta, y, steps=8)
+            finally:
+                await page.mouse.up()
+            await page.wait_for_timeout(350)
+            after_drag = await audio.evaluate("a => ({time:a.currentTime,seeks:a.__publicVerifierSeeks})")
+            await audio.evaluate("a => a.pause()")
+            result["drag"] = {"method": "native_pointer_down_move_up", "horizontal_pixels": delta,
+                              "before": state["time"], "after": after_drag["time"],
+                              "new_seeked_events": after_drag["seeks"] - state["seeks"]}
+            require(after_drag["seeks"] > state["seeks"] and
+                    abs(after_drag["time"] - state["time"]) > min(.25, first["duration"] * .06),
+                    "Physical native timeline drag did not produce a new seeked event and time change")
+            result["physical_drag_verified"] = True
+        except Exception as error:
+            result["drag_error"] = error_text(error)
+    return result
+
+
+async def homepage(context):
+    page = await context.new_page()
+    try:
+        await navigate(page, "/")
+        text = await page.locator("body").inner_text()
+        require(not re.search(r"Local recovery preview|\bPARTIAL\b|Dataset public download is not enabled",
+                              text, re.I), "Internal recovery banner is publicly visible")
+        link = page.get_by_role("link", name="Reproduction guide", exact=True)
+        require(await link.count() == 1, "Reproduction guide link is not unique")
+        require(await link.get_attribute("href") == GUIDE, "Guide href differs from the approved URL")
+        async with page.expect_popup(timeout=30_000) as opened:
+            await link.click()
+        guide = await opened.value
+        try:
+            await guide.wait_for_load_state("domcontentloaded", timeout=35_000)
+            await challenge_check(guide)
+            require(guide.url == GUIDE, "Guide popup did not reach the exact public document")
+            await guide.get_by_role("heading", name="Reproducing GTR-Voice research paths",
+                                    exact=True).wait_for(timeout=30_000)
+            require("Measured runs on the original released audio" in await guide.locator("body").inner_text(),
+                    "Guide popup did not render the reproduction content")
+        finally:
+            await guide.close()
+        return {"passed": True, "no_internal_banner": True,
+                "guide_unique_exact_href_and_real_popup_content": True}
+    finally:
+        await page.close()
+
+
+async def comparisons(context, network):
+    page = await context.new_page()
+    try:
+        await navigate(page, "/")
+        await page.wait_for_function("document.querySelectorAll('.audio-table tbody audio').length === 36")
+        require(await page.locator(".audio-table tbody tr").count() == 12, "Comparison rows differ from 12")
+        results, failures = [], []
+        for index in range(36):
+            try:
+                result = await media_probe(page, page.locator(".audio-table tbody audio").nth(index),
+                                           test_drag=index == 0)
+                result["player_index"] = index
+                result["same_origin_media_http_206"] = any(
+                    item["path"] == result["path"] and item["status"] == 206 for item in network)
+                require(result["same_origin_media_http_206"], "No observed browser media HTTP 206")
+                results.append(result)
+                if index == 0 and not result["physical_drag_verified"]:
+                    failures.append({"player_index": index, "check": "physical_drag",
+                                     "error": result.get("drag_error", "Drag not verified")})
+            except Exception as error:
+                failures.append({"player_index": index, "error": error_text(error)})
+            emit("comparison_progress", completed=index + 1, failures=len(failures))
+        return {"passed": not failures, "rows": 12, "players": 36,
+                "verified_play_and_seek": results, "failures": failures}
+    finally:
+        await page.close()
+
+
+async def graph(context):
+    page = await context.new_page()
+    try:
+        await navigate(page, "/GTR-3D-plot")
+        await page.wait_for_function("""() => {
+          const p=document.querySelector('.plotly-graph-div');
+          return p && p.data && p._fullLayout && p.querySelector('canvas');
+        }""", timeout=30_000)
+        points = await page.locator(".plotly-graph-div").evaluate(
+            "p => p.data.filter(t=>t.type==='scatter3d').reduce((n,t)=>n+t.x.length,0)")
+        require(points == 125, "Rendered graph data is not the original 125 points")
+        await page.locator(".plotly-graph-div").evaluate("""p => {
+          window.__publicVerifierHover=null;
+          p.on('plotly_hover', e => { window.__publicVerifierHover=e.points[0].customdata[0]; });
+          p.on('plotly_unhover', () => { window.__publicVerifierHover=null; });
+        }""")
+        box = await page.locator(".plotly-graph-div").bounding_box()
+        clicked = False
+        # Listen to real Plotly hover events while moving the real pointer.
+        # Do not emit a plotly_click or assign the player's source to fake a hit.
+        for y in range(70, min(int(box["height"]) - 30, 470), 22):
+            for x in range(100, int(box["width"]) - 130, 22):
+                await page.mouse.move(box["x"] + x, box["y"] + y)
+                await page.wait_for_timeout(25)
+                hovered = await page.evaluate("window.__publicVerifierHover")
+                if hovered and not hovered.endswith("/010/18.wav"):
+                    await page.mouse.click(box["x"] + x, box["y"] + y)
+                    clicked = True
+                    break
+            if clicked:
+                break
+        require(clicked, "GRAPH_RENDER_OR_HIT_TEST_UNAVAILABLE: no real point hover/click; no bypass attempted")
+        result = await media_probe(page, page.locator("#gtr-graph-audio"), already_playing=True, test_drag=True)
+        return {"passed": result["physical_drag_verified"], "scatter3d_points": points,
+                "point_click": "real_pointer_after_observed_plotly_hover",
+                "player": result, "physical_drag_verified": result["physical_drag_verified"]}
+    finally:
+        await page.close()
+
+
+async def evaluation(context, path):
+    page = await context.new_page()
+    try:
+        await navigate(page, path)
+        require(await page.locator("table audio").count() == 72, "Evaluation does not contain 72 stimuli")
+        sources = await page.locator("table audio").evaluate_all("items=>items.map(a=>a.src)")
+        require(all(public_url(url).startswith(ORIGIN + "/") for url in sources), "Evaluation audio left origin")
+        # CSP correctly forbids fetch via connect-src 'none'. Trigger the real
+        # DOM media loader instead (media-src permits this), then capture that
+        # browser response. No API client, CSP override or altered UA is used.
+        semaphore = asyncio.Semaphore(4)
+        async def decode_public_resource(index, url):
+            async with semaphore:
+                try:
+                    audio = page.locator("table audio").nth(index)
+                    async with page.expect_response(
+                        lambda response: response.url == url and response.request.resource_type == "media",
+                        timeout=15_000,
+                    ) as loaded:
+                        await audio.evaluate("a => { a.preload='auto'; a.load(); }")
+                    response = await loaded.value
+                    require(response.status in (200, 206),
+                            f"PUBLIC_AUDIO_MEDIA_HTTP_{response.status}; no challenge bypass attempted")
+                    completion = await asyncio.wait_for(response.finished(), timeout=20)
+                    require(completion is None, "Media response did not finish successfully")
+                    raw = await response.body()
+                    if response.status == 206:
+                        match = re.fullmatch(r"bytes (\d+)-(\d+)/(\d+)",
+                                             response.headers.get("content-range", ""))
+                        require(match and int(match[1]) == 0 and
+                                int(match[2]) + 1 == int(match[3]) == len(raw),
+                                "Observed media range does not cover the complete audio file; no supplemental request made")
+                    declared = response.headers.get("content-length")
+                    require(not declared or int(declared) == len(raw), "Incomplete media response body")
+                    require(raw[:4] == b"RIFF" and raw[8:12] == b"WAVE",
+                            "PUBLIC_AUDIO_NOT_WAV_OR_CHALLENGE; no bypass attempted")
+                    decoded_audio = await page.evaluate("""async encoded => {
+                      const bytes=Uint8Array.from(atob(encoded),c=>c.charCodeAt(0));
+                      const ctx=new AudioContext();
+                      try {
+                        const audio=await ctx.decodeAudioData(bytes.buffer);
+                        if(!audio.length || !Number.isFinite(audio.duration) || audio.duration<=0) throw Error('Empty/nonfinite decode');
+                        for(let c=0;c<audio.numberOfChannels;c++) {
+                          const channel=audio.getChannelData(c);
+                          for(let i=0;i<channel.length;i++) if(!Number.isFinite(channel[i])) throw Error('Nonfinite PCM');
+                        }
+                        return {frames:audio.length,decoded_sample_rate:audio.sampleRate};
+                      } finally { await ctx.close(); }
+                    }""", base64.b64encode(raw).decode("ascii"))
+                    return {"path": urlsplit(url).path, "passed": True,
+                            "http_status": response.status, "bytes": len(raw),
+                            "request_range": response.request.headers.get("range"),
+                            "content_range": response.headers.get("content-range"),
+                            "complete_body_verified": True, **decoded_audio}
+                except Exception as error:
+                    return {"path": urlsplit(url).path, "passed": False, "error": error_text(error)}
+        decoded = await asyncio.gather(*(decode_public_resource(index, url) for index, url in enumerate(sources)))
+        player, player_error = None, None
+        try:
+            player = await media_probe(page, page.locator("table audio").first, test_drag=True)
+        except Exception as error:
+            player_error = error_text(error)
+        failures = [item for item in decoded if not item["passed"]]
+        return {"passed": not failures and player_error is None and bool(player and player["physical_drag_verified"]), "page": path,
+                "stimuli": len(sources), "browser_decoded": sum(item["passed"] for item in decoded),
+                "resource_transport": "actual DOM HTMLMediaElement.load browser media response; not fetch/API client",
+                "decoder": "Chromium AudioContext.decodeAudioData", "page_csp_unchanged": True,
+                "decoded": decoded, "player": player, "player_error": player_error}
+    finally:
+        await page.close()
+
+
+async def dataset_download(context, scratch):
+    page = await context.new_page()
+    try:
+        await navigate(page, "/")
+        link = page.get_by_role("link", name="Dataset Download", exact=True)
+        require(await link.count() == 1, "Dataset Download is not a unique visitor link")
+        require(await link.evaluate("a=>a.href") == ORIGIN + "/GTR-Voice.zip", "Dataset link changed unexpectedly")
+        emit("full_download_started", expected_bytes=ZIP_BYTES, attempts=1)
+        async with page.expect_download(timeout=45_000) as started:
+            await link.click()
+        download = await started.value
+        require(download.suggested_filename == "GTR-Voice.zip", "Unexpected downloaded filename")
+        output = scratch / "complete-original.zip"
+        try:
+            await asyncio.wait_for(download.save_as(output), timeout=300)
+        except Exception:
+            await download.cancel()
+            raise
+        require(await download.failure() is None, "Browser download reported failure")
+        require(output.stat().st_size == ZIP_BYTES, "Complete ZIP byte length differs")
+        digest = hashlib.sha256()
+        with output.open("rb") as stream:
+            for block in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(block)
+        require(digest.hexdigest() == ZIP_SHA256, "Complete ZIP SHA256 differs")
+        with zipfile.ZipFile(output) as archive:
+            entries = archive.infolist()
+            wavs = [entry for entry in entries if not entry.is_dir() and entry.filename.lower().endswith(".wav")]
+            require(len(wavs) == 2500 and len({entry.filename for entry in wavs}) == 2500,
+                    "ZIP does not contain 2500 unique WAV file members")
+        return {"passed": True, "method": "real_link_click_expect_download_save_as_full_file_hash",
+                "download_attempts": 1, "bytes": output.stat().st_size, "sha256": digest.hexdigest(),
+                "zip_entries_including_directories": len(entries), "zip_wav_file_members": len(wavs),
+                "crc_test": "not_run; exact whole-file SHA256 verified", "extracted": False}
+    finally:
+        await page.close()
+
+
+async def verify(scratch, report):
+    from playwright.async_api import async_playwright
+    network, legacy = [], []
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch(
+            channel="chrome", headless=True, chromium_sandbox=True,
+            downloads_path=str(scratch / "browser-downloads"))
+        report["browser"] = {"engine": "preinstalled Google Chrome (Chromium)", "version": browser.version,
+                             "profile": "fresh_nonpersistent", "sandbox_enabled": True,
+                             "user_agent_override": False, "closed": False}
+        try:
+            context = await browser.new_context(accept_downloads=True, viewport={"width": 1440, "height": 1000})
+            context.set_default_timeout(20_000)
+            def observed(response):
+                url = urlsplit(response.url)
+                if url.scheme + "://" + url.netloc == ORIGIN and url.path.lower().endswith(".wav"):
+                    network.append({"path": url.path, "status": response.status,
+                                    "content_range": response.headers.get("content-range")})
+            def requested(request):
+                host = urlsplit(request.url).netloc.lower()
+                if "ngrok" in host:
+                    legacy.append(public_url(request.url))
+            context.on("response", observed)
+            context.on("request", requested)
+            # Complete the single ZIP attempt early, so a later WebGL/media
+            # environment failure cannot discard download evidence.
+            checks = [("homepage_and_guide", 90, lambda: homepage(context)),
+                      ("complete_dataset_download", 420, lambda: dataset_download(context, scratch)),
+                      ("comparison_audio", 180, lambda: comparisons(context, network)),
+                      ("graph_click_and_timeline", 60, lambda: graph(context)),
+                      ("fastpitch_evaluation", 120, lambda: evaluation(context, "/fspt/evaluation_1.html")),
+                      ("styletts_evaluation", 120, lambda: evaluation(context, "/stts/evaluation_22.html"))]
+            for name, seconds, action in checks:
+                emit("check_started", check=name)
+                try:
+                    result = await asyncio.wait_for(action(), timeout=seconds)
+                except Exception as error:
+                    result = {"passed": False, "error": error_text(error) or type(error).__name__}
+                report["checks"][name] = result
+                emit("check_finished", check=name, passed=result["passed"])
+            report["network"] = {"observed_same_origin_audio_http_206": sum(item["status"] == 206 for item in network),
+                                 "audio_206_examples": [item for item in network if item["status"] == 206][:5],
+                                 "legacy_ngrok_requests": legacy}
+            require(not legacy, "Observed requests to a legacy ngrok host")
+            require(report["network"]["observed_same_origin_audio_http_206"] > 0, "No actual browser media HTTP 206 observed")
+            await context.close()
+        finally:
+            await browser.close()
+            report["browser"]["closed"] = True
+
+
+def main():
+    report = {"schema_version": 1, "started_utc": datetime.now(timezone.utc).isoformat(),
+              "origin": ORIGIN, "scope": "fresh disposable Chromium; public resources only",
+              "checks": {}, "failures": [], "physical_drag_verified": False,
+              "human_listening_quality_rated": False}
+    temporary = None
+    try:
+        require(os.environ.get("GITHUB_ACTIONS") == "true" and platform.system() == "Linux",
+                "REFUSED_NOT_GITHUB_LINUX_RUNNER: no local ZIP download is permitted")
+        launcher = shutil.which("google-chrome")
+        require(launcher and Path("/opt/google/chrome/chrome").is_file(),
+                "Required preinstalled system Google Chrome is unavailable; no binary fallback")
+        version = subprocess.run([launcher, "--version"], check=True, capture_output=True,
+                                 text=True, timeout=10).stdout.strip()
+        report["platform"] = {"system": platform.system(), "release": platform.release(),
+                              "machine": platform.machine(), "google_chrome_launcher": launcher,
+                              "google_chrome_binary": "/opt/google/chrome/chrome",
+                              "google_chrome_version": version, "binary_fallback_permitted": False}
+        emit("platform_preflight", **report["platform"])
+        temporary = tempfile.TemporaryDirectory(prefix="gtr-public-browser-")
+        scratch = Path(temporary.name)
+        require(shutil.disk_usage(scratch).free >= 3 * ZIP_BYTES + 1024 ** 3,
+                "Insufficient ephemeral runner space for browser and saved ZIP")
+        emit("ephemeral_storage_created", minimum_free_bytes=3 * ZIP_BYTES + 1024 ** 3)
+        async def bounded():
+            await asyncio.wait_for(verify(scratch, report), timeout=1000)
+        asyncio.run(bounded())
+    except Exception as error:
+        report["failures"].append(error_text(error))
+    finally:
+        if temporary is not None:
+            root = Path(temporary.name)
+            try:
+                retained = sum(item.stat().st_size for item in root.rglob("*") if item.is_file())
+            except OSError:
+                retained = None
+            try:
+                temporary.cleanup()
+                report["cleanup"] = {"temporary_downloads_deleted": not root.exists(),
+                                     "temporary_file_bytes_before_removal": retained,
+                                     "browser_context": "closed on normal completion; isolated runner lifetime bounds failures"}
+            except Exception as error:
+                report["cleanup"] = {"temporary_downloads_deleted": False, "error": error_text(error)}
+                report["failures"].append("Temporary download cleanup failed")
+            emit("cleanup", **report["cleanup"])
+    expected = {"homepage_and_guide", "comparison_audio", "graph_click_and_timeline",
+                "fastpitch_evaluation", "styletts_evaluation", "complete_dataset_download"}
+    for name in sorted(expected):
+        if not report["checks"].get(name, {}).get("passed"):
+            report["failures"].append(name)
+    first = next((item for item in report["checks"].get("comparison_audio", {}).get("verified_play_and_seek", [])
+                  if item.get("player_index") == 0), {})
+    report["drag_checks"] = {
+        "homepage_first_player": first.get("physical_drag_verified", False),
+        "graph_player": report["checks"].get("graph_click_and_timeline", {}).get("player", {}).get("physical_drag_verified", False),
+        "fastpitch_evaluation": (report["checks"].get("fastpitch_evaluation", {}).get("player") or {}).get("physical_drag_verified", False),
+        "styletts_evaluation": (report["checks"].get("styletts_evaluation", {}).get("player") or {}).get("physical_drag_verified", False),
+    }
+    report["physical_drag_verified"] = all(report["drag_checks"].values())
+    report["status"] = "PASS" if not report["failures"] and report.get("cleanup", {}).get("temporary_downloads_deleted") else "FAILED_OR_PARTIAL"
+    report["finished_utc"] = datetime.now(timezone.utc).isoformat()
+    emit("final_result", result=report)
+    summary = os.environ.get("GITHUB_STEP_SUMMARY")
+    if summary:
+        with open(summary, "a", encoding="utf-8") as stream:
+            stream.write("## GTR public browser verification: " + report["status"] + "\n\n```json\n")
+            stream.write(json.dumps(report, ensure_ascii=False, indent=2) + "\n```\n")
+    return 0 if report["status"] == "PASS" else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
